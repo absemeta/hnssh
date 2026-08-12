@@ -3,6 +3,9 @@ use scraper::{ElementRef, Html, Node};
 
 use crate::content::{Link, RichText, RichTextLine, RichTextSpan, RichTextStyle};
 
+const MAX_HTML_INPUT_BYTES: usize = 128 * 1024;
+const MAX_EXTRACTED_LINKS: usize = 256;
+
 pub(crate) struct NormalizedContent {
     pub(crate) text: RichText,
     pub(crate) links: Vec<Link>,
@@ -15,6 +18,7 @@ pub(crate) struct ValidatedUrl {
 }
 
 pub(crate) fn normalize_html(value: &str) -> NormalizedContent {
+    let (value, input_truncated) = bounded_html_input(value);
     let fragment = Html::parse_fragment(value);
     let mut builder = RichTextBuilder::default();
     let mut links = Vec::new();
@@ -28,6 +32,14 @@ pub(crate) fn normalize_html(value: &str) -> NormalizedContent {
         &mut omitted_link_count,
         true,
     );
+    if input_truncated {
+        builder.separate_block();
+        builder.push_text(
+            "[content truncated at safety limit]",
+            RichTextStyle::default(),
+            false,
+        );
+    }
     NormalizedContent {
         text: builder.finish(),
         links,
@@ -61,6 +73,17 @@ pub(crate) fn validated_url(value: &str) -> Option<ValidatedUrl> {
 
 fn forbidden_url_character(character: char) -> bool {
     character.is_control() || is_bidi_control(character)
+}
+
+fn bounded_html_input(value: &str) -> (&str, bool) {
+    if value.len() <= MAX_HTML_INPUT_BYTES {
+        return (value, false);
+    }
+    let mut end = MAX_HTML_INPUT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&value[..end], true)
 }
 
 fn walk_children<'a>(
@@ -111,10 +134,14 @@ fn walk_children<'a>(
                     "a" if collect_links => {
                         if let Some(destination) = element.value().attr("href") {
                             if let Some(destination) = validated_url(destination) {
-                                let label = normalized_link_label(element)
-                                    .unwrap_or_else(|| destination.destination.clone());
-                                links.push(Link::new(label, destination.destination));
-                                style.link = true;
+                                if links.len() < MAX_EXTRACTED_LINKS {
+                                    let label = normalized_link_label(element)
+                                        .unwrap_or_else(|| destination.destination.clone());
+                                    links.push(Link::new(label, destination.destination));
+                                    style.link = true;
+                                } else {
+                                    *omitted_link_count = omitted_link_count.saturating_add(1);
+                                }
                             } else {
                                 *omitted_link_count = omitted_link_count.saturating_add(1);
                             }
@@ -434,5 +461,16 @@ mod tests {
         assert!(normalized.starts_with(&"é".repeat(4_096)));
         assert!(normalized.contains("🦀"));
         assert!(!normalized.chars().any(is_bidi_control));
+    }
+
+    #[test]
+    fn bounds_oversized_html_before_parsing() {
+        let normalized =
+            normalize_html(&format!("<p>{}</p>", "x".repeat(MAX_HTML_INPUT_BYTES * 2)))
+                .text
+                .plain_text();
+
+        assert!(normalized.contains("[content truncated at safety limit]"));
+        assert!(normalized.len() < MAX_HTML_INPUT_BYTES + 100);
     }
 }

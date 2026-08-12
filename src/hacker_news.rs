@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use reqwest::{Client, Response, StatusCode, header};
 use serde::Deserialize;
 use tokio::sync::{Mutex, Semaphore, oneshot};
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 
 use crate::content::{
     ContentError, ContentFreshness, ContentFuture, ContentSnapshot, ContentSource, EntryDetails,
@@ -17,6 +17,7 @@ use crate::content_safety::{normalize_html, normalize_inline_text, validated_url
 
 const PRODUCTION_ENDPOINT: &str = "https://hacker-news.firebaseio.com/v0";
 const MAX_POLL_OPTIONS: usize = 64;
+const POLL_OPTION_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resource, retry, and cache bounds for the Hacker News adapter.
 #[derive(Clone, Debug)]
@@ -166,6 +167,32 @@ impl HackerNewsContent {
             .await
     }
 
+    async fn poll_option_request(&self, id: FeedEntryId, request: CacheRequest) -> PollOption {
+        match self.item_request(id, request).await {
+            Ok(snapshot) => {
+                let freshness = snapshot.freshness;
+                let age = snapshot.current_age();
+                let option = match snapshot.value {
+                    ResourceValue::Item { item, .. } => item.poll_option,
+                    ResourceValue::TopFeed(_) => None,
+                };
+                match option {
+                    Some(mut option) => {
+                        if freshness.is_stale() {
+                            option.status = PollOptionStatus::Stale { age };
+                        }
+                        option
+                    }
+                    None => PollOption::placeholder(PollOptionStatus::Unavailable),
+                }
+            }
+            Err(ContentError::Retryable) => PollOption::placeholder(PollOptionStatus::Retryable),
+            Err(ContentError::Unavailable) => {
+                PollOption::placeholder(PollOptionStatus::Unavailable)
+            }
+        }
+    }
+
     fn feed_entry_request(
         &self,
         id: FeedEntryId,
@@ -185,31 +212,16 @@ impl HackerNewsContent {
             })?;
 
             if let FeedEntry::Poll { options, .. } = &mut entry.value {
-                for option_id in poll_option_ids {
-                    match self.item_request(option_id, request).await {
-                        Ok(snapshot) => {
-                            let freshness = snapshot.freshness;
-                            let age = snapshot.current_age();
-                            let mut option = match snapshot.value {
-                                ResourceValue::Item { item, .. } => item.poll_option,
-                                ResourceValue::TopFeed(_) => None,
-                            }
-                            .unwrap_or_else(|| {
-                                PollOption::placeholder(PollOptionStatus::Unavailable)
-                            });
-                            if freshness.is_stale() {
-                                option.status = PollOptionStatus::Stale { age };
-                            }
-                            options.push(option);
-                        }
-                        Err(ContentError::Retryable) => {
-                            options.push(PollOption::placeholder(PollOptionStatus::Retryable))
-                        }
-                        Err(ContentError::Unavailable) => {
-                            options.push(PollOption::placeholder(PollOptionStatus::Unavailable))
-                        }
+                let option_count = poll_option_ids.len();
+                let load = async {
+                    for option_id in poll_option_ids {
+                        options.push(self.poll_option_request(option_id, request).await);
                     }
-                }
+                };
+                let _ = timeout(POLL_OPTION_LOAD_TIMEOUT, load).await;
+                options.resize_with(option_count, || {
+                    PollOption::placeholder(PollOptionStatus::Retryable)
+                });
                 if poll_options_truncated {
                     options.push(PollOption::placeholder(PollOptionStatus::LimitReached));
                 }
