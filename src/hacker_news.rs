@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use reqwest::{Client, Response, StatusCode, header};
 use serde::Deserialize;
 use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep};
 
 use crate::content::{
@@ -16,6 +17,7 @@ use crate::content::{
 use crate::content_safety::{normalize_html, normalize_inline_text, validated_url};
 
 const PRODUCTION_ENDPOINT: &str = "https://hacker-news.firebaseio.com/v0";
+const POLL_OPTION_CONCURRENCY: usize = 8;
 
 /// Resource, retry, and cache bounds for the Hacker News adapter.
 #[derive(Clone, Debug)]
@@ -208,9 +210,38 @@ impl HackerNewsContent {
             })?;
 
             if let FeedEntry::Poll { options, .. } = &mut entry.value {
-                for option_id in poll_option_ids {
-                    options.push(self.poll_option_request(option_id, request).await);
+                let mut pending = poll_option_ids.into_iter().enumerate();
+                let mut loaded_options = vec![None; pending.len()];
+                let mut loads = JoinSet::new();
+                for _ in 0..POLL_OPTION_CONCURRENCY {
+                    let Some((position, option_id)) = pending.next() else {
+                        break;
+                    };
+                    let source = self.clone();
+                    loads.spawn(async move {
+                        (
+                            position,
+                            source.poll_option_request(option_id, request).await,
+                        )
+                    });
                 }
+                while let Some(result) = loads.join_next().await {
+                    if let Ok((position, option)) = result {
+                        loaded_options[position] = Some(option);
+                    }
+                    if let Some((position, option_id)) = pending.next() {
+                        let source = self.clone();
+                        loads.spawn(async move {
+                            (
+                                position,
+                                source.poll_option_request(option_id, request).await,
+                            )
+                        });
+                    }
+                }
+                options.extend(loaded_options.into_iter().map(|option| {
+                    option.unwrap_or_else(|| PollOption::placeholder(PollOptionStatus::Retryable))
+                }));
             }
 
             Ok(entry)
