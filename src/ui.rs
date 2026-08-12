@@ -69,7 +69,7 @@ fn render_feed(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
         }
         FeedStatus::Unavailable => {
             lines.push(Line::from("Top feed unavailable"));
-            lines.push(Line::from("Reconnect later to retry."));
+            lines.push(Line::from("Press r to retry."));
         }
         FeedStatus::Ready if browser.rows().is_empty() => {
             lines.push(Line::from("The top feed is empty."));
@@ -101,7 +101,7 @@ fn render_feed(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
     }
     frame.render_widget(Paragraph::new(lines), inner);
     frame.render_widget(
-        Paragraph::new("↑/↓ or j/k move · PgUp/PgDn page · Enter details · ? help · q quit")
+        Paragraph::new("j/k move · PgUp/PgDn page · Enter details · r retry · ? help · q quit")
             .alignment(Alignment::Center),
         footer,
     );
@@ -222,6 +222,7 @@ fn render_help(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
         Line::from("Enter                  Open the selected entry or its links"),
         Line::from("Escape / Backspace     Return to the previous view"),
         Line::from("?                      Open this help"),
+        Line::from("r                      Retry an unavailable top feed"),
         Line::from("q                      Quit HNSSH"),
     ];
     let panel = Paragraph::new(lines)
@@ -237,8 +238,9 @@ fn render_help(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
 
 fn feed_metadata(state: &FeedRowState) -> String {
     match state {
-        FeedRowState::Loading => "waiting for fixture content".to_owned(),
+        FeedRowState::Loading => "waiting for Hacker News".to_owned(),
         FeedRowState::Unavailable => "unavailable".to_owned(),
+        FeedRowState::Retryable => "temporary failure · retry later".to_owned(),
         FeedRowState::Ready(entry) => entry
             .details()
             .map(metadata)

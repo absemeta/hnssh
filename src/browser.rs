@@ -13,6 +13,7 @@ pub(crate) enum FeedRowState {
     Loading,
     Ready(FeedEntry),
     Unavailable,
+    Retryable,
 }
 
 #[derive(Clone, Debug)]
@@ -28,13 +29,14 @@ impl FeedRow {
             FeedRowState::Loading => "Loading feed entry…",
             FeedRowState::Ready(entry) => entry.title(),
             FeedRowState::Unavailable => "[feed entry unavailable]",
+            FeedRowState::Retryable => "[feed entry temporarily unavailable]",
         }
     }
 
     pub(crate) fn entry(&self) -> Option<&FeedEntry> {
         match &self.state {
             FeedRowState::Ready(entry) => Some(entry),
-            FeedRowState::Loading | FeedRowState::Unavailable => None,
+            FeedRowState::Loading | FeedRowState::Unavailable | FeedRowState::Retryable => None,
         }
     }
 }
@@ -70,6 +72,7 @@ enum ViewState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandOutcome {
     Redraw,
+    ReloadTopFeed,
     Unchanged,
     Quit,
 }
@@ -130,8 +133,12 @@ impl Browser {
         }
 
         row.state = match result {
+            Ok(FeedEntry::Unavailable { id: entry_id }) if entry_id == id => {
+                FeedRowState::Unavailable
+            }
             Ok(entry) if entry.id() == id => FeedRowState::Ready(entry),
-            Ok(_) | Err(_) => FeedRowState::Unavailable,
+            Err(ContentError::Retryable) => FeedRowState::Retryable,
+            Ok(_) | Err(ContentError::Unavailable) => FeedRowState::Unavailable,
         };
     }
 
@@ -191,6 +198,13 @@ impl Browser {
     pub(crate) fn handle_key(&mut self, key: Key, page_len: usize) -> CommandOutcome {
         if key == Key::Quit {
             return CommandOutcome::Quit;
+        }
+        if key == Key::Refresh
+            && self.view_kind() == ViewKind::Feed
+            && self.feed_status == FeedStatus::Unavailable
+        {
+            self.feed_status = FeedStatus::Loading;
+            return CommandOutcome::ReloadTopFeed;
         }
         if key == Key::Help {
             if self.view_kind() == ViewKind::Help {

@@ -9,6 +9,7 @@ pub(crate) enum Key {
     Enter,
     Back,
     Help,
+    Refresh,
     Quit,
 }
 
@@ -59,6 +60,7 @@ fn decode_one(bytes: &[u8]) -> Decode {
         b'g' => Decode::Key(Key::First, 1),
         b'G' => Decode::Key(Key::Last, 1),
         b'?' => Decode::Key(Key::Help, 1),
+        b'r' => Decode::Key(Key::Refresh, 1),
         b'q' => Decode::Key(Key::Quit, 1),
         b'\r' | b'\n' => Decode::Key(Key::Enter, 1),
         0x08 | 0x7f => Decode::Key(Key::Back, 1),

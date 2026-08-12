@@ -6,7 +6,7 @@ use thiserror::Error;
 
 pub type FeedEntryId = u64;
 
-type ContentFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type ContentFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The browsing boundary for Hacker News content.
 ///
@@ -23,6 +23,8 @@ pub trait ContentSource: Send + Sync {
 pub enum ContentError {
     #[error("content is unavailable")]
     Unavailable,
+    #[error("content is temporarily unavailable")]
+    Retryable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,7 +34,7 @@ pub struct Link {
 }
 
 impl Link {
-    fn new(label: impl Into<String>, destination: impl Into<String>) -> Self {
+    pub(crate) fn new(label: impl Into<String>, destination: impl Into<String>) -> Self {
         Self {
             label: label.into(),
             destination: destination.into(),
@@ -43,7 +45,7 @@ impl Link {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntryDetails {
     pub id: FeedEntryId,
-    pub title: String,
+    pub title: Option<String>,
     pub source: Option<String>,
     pub score: Option<u32>,
     pub author: Option<String>,
@@ -73,6 +75,7 @@ pub enum FeedEntry {
     Unsupported {
         id: FeedEntryId,
         item_type: String,
+        title: Option<String>,
     },
 }
 
@@ -94,8 +97,15 @@ impl FeedEntry {
     }
 
     pub fn title(&self) -> &str {
-        self.details()
-            .map_or("[unavailable feed entry]", |details| &details.title)
+        match self {
+            Self::Story(details) | Self::Job(details) | Self::Poll { details, .. } => {
+                details.title.as_deref().unwrap_or("[title unavailable]")
+            }
+            Self::Unavailable { .. } => "[feed entry unavailable]",
+            Self::Unsupported { title, .. } => {
+                title.as_deref().unwrap_or("[unsupported feed entry]")
+            }
+        }
     }
 
     pub fn kind_label(&self) -> &str {
@@ -163,7 +173,7 @@ impl FixtureContent {
             ),
             FeedEntry::Job(EntryDetails {
                 id: 103,
-                title: "Acme is hiring terminal-minded engineers".to_owned(),
+                title: Some("Acme is hiring terminal-minded engineers".to_owned()),
                 source: Some("jobs.example.com".to_owned()),
                 score: None,
                 author: None,
@@ -178,7 +188,7 @@ impl FixtureContent {
             FeedEntry::Poll {
                 details: EntryDetails {
                     id: 104,
-                    title: "Which terminal key do you use most?".to_owned(),
+                    title: Some("Which terminal key do you use most?".to_owned()),
                     source: None,
                     score: Some(73),
                     author: Some("grace".to_owned()),
@@ -348,7 +358,7 @@ fn story(
 ) -> FeedEntry {
     FeedEntry::Story(EntryDetails {
         id,
-        title: title.to_owned(),
+        title: Some(title.to_owned()),
         source: metadata.source.map(str::to_owned),
         score: Some(metadata.score),
         author: Some(metadata.author.to_owned()),

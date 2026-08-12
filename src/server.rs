@@ -12,6 +12,7 @@ use russh::server::{self, Auth, Handler, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect, MethodSet, Pty};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
@@ -19,7 +20,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::browser::{Browser, CommandOutcome};
-use crate::content::{ContentError, ContentSource, FeedEntry, FeedEntryId, FixtureContent};
+use crate::content::{ContentError, ContentSource, FeedEntry, FeedEntryId};
+use crate::hacker_news::HackerNewsContent;
 use crate::input::{InputDecoder, Key};
 use crate::ui;
 
@@ -30,6 +32,8 @@ const DEFAULT_SESSION_SIZE: TerminalSize = TerminalSize {
 const MAX_COLUMNS: u16 = 300;
 const MAX_ROWS: u16 = 120;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const TOP_FEED_PAGE_SIZE: usize = 30;
+const PAGE_ITEM_CONCURRENCY: usize = 8;
 const ENTER_SCREEN: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l";
 const LEAVE_SCREEN: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1049l";
 const PTY_REQUIRED_MESSAGE: &[u8] =
@@ -96,7 +100,7 @@ pub struct Server {
 
 impl Server {
     pub async fn bind(config: ServerConfig) -> Result<Self, ServerError> {
-        Self::bind_with_content(config, Arc::new(FixtureContent::default())).await
+        Self::bind_with_content(config, Arc::new(HackerNewsContent::production())).await
     }
 
     pub async fn bind_with_content(
@@ -313,6 +317,10 @@ impl SessionActor {
         while let Some(event) = events.recv().await {
             match event {
                 ActorEvent::TopFeed(result) => {
+                    let result = result.map(|mut ids| {
+                        ids.truncate(TOP_FEED_PAGE_SIZE);
+                        ids
+                    });
                     let ids = result.as_ref().ok().cloned();
                     self.browser.set_top_feed(result);
                     self.render().await?;
@@ -327,6 +335,10 @@ impl SessionActor {
                 ActorEvent::Input(key) => {
                     match self.browser.handle_key(key, self.size.page_len()) {
                         CommandOutcome::Redraw => self.render().await?,
+                        CommandOutcome::ReloadTopFeed => {
+                            self.render().await?;
+                            self.load_top_feed(event_sender.clone());
+                        }
                         CommandOutcome::Unchanged => {}
                         CommandOutcome::Quit => {
                             self.finish().await;
@@ -355,11 +367,16 @@ impl SessionActor {
     }
 
     fn load_entries(&self, ids: Vec<FeedEntryId>, events: &UnboundedSender<ActorEvent>) {
+        let page_limit = Arc::new(Semaphore::new(PAGE_ITEM_CONCURRENCY));
         for (index, id) in ids.into_iter().enumerate() {
             let source = Arc::clone(&self.source);
             let events = events.clone();
+            let page_limit = Arc::clone(&page_limit);
             tokio::spawn(async move {
-                let result = source.feed_entry(id).await;
+                let result = match page_limit.acquire_owned().await {
+                    Ok(_permit) => source.feed_entry(id).await,
+                    Err(_) => Err(ContentError::Retryable),
+                };
                 let _ = events.send(ActorEvent::FeedEntry { index, id, result });
             });
         }
