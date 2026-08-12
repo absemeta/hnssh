@@ -1,7 +1,7 @@
 # HNSSH
 
 HNSSH is an anonymously accessible, full-screen Hacker News browser served over SSH.
-The current runnable slice progressively pages through Hacker News's official top feed, with shared bounded caching, refresh, stale fallback, and local failure states.
+The current runnable slice progressively pages through Hacker News's official top feed, with shared bounded caching, refresh, stale fallback, local failure states, safely rendered rich details, validated links, and poll options.
 
 ## Run locally
 
@@ -37,4 +37,4 @@ A client must request an interactive PTY. If automatic PTY allocation is unavail
 cargo test
 ```
 
-The acceptance tests connect through a real SSH transport, apply server output to an emulated terminal, and verify anonymous authentication, progressive paging against a fake HTTP endpoint, request sharing and limits, refresh throttling, retries, stale fallback, bounded cache eviction, partial failures, navigation, details, links, help, resize behavior, terminal restoration, clean exit, and the no-PTY error path.
+The acceptance tests connect through a real SSH transport, apply server output to an emulated terminal, and verify anonymous authentication, progressive paging against a fake HTTP endpoint, request sharing and limits, refresh throttling, retries, stale fallback, bounded cache eviction, partial failures, hostile rich content, poll options, navigation, details, validated links, help, resize behavior, terminal restoration, clean exit, and the no-PTY error path.

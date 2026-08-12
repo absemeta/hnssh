@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::browser::{Browser, FeedRowState, FeedStatus, ViewKind};
-use crate::content::{ContentFreshness, EntryDetails, FeedEntry};
+use crate::content::{ContentFreshness, EntryDetails, FeedEntry, RichText};
 
 pub(crate) const MIN_COLUMNS: u16 = 60;
 pub(crate) const MIN_ROWS: u16 = 16;
@@ -147,7 +147,7 @@ fn render_detail(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
         append_detail_metadata(&mut lines, details);
         if let Some(text) = &details.text {
             lines.push(Line::from(""));
-            lines.push(Line::from(text.as_str()));
+            lines.extend(render_rich_text(text));
         }
     }
     if let FeedEntry::Poll { options, .. } = entry {
@@ -156,7 +156,7 @@ fn render_detail(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
         for option in options {
             let score = option
                 .score
-                .map(|score| format!(" — {score} points"))
+                .map(|score| format!(" — {}", points(score)))
                 .unwrap_or_default();
             lines.push(Line::from(format!("• {}{score}", option.text)));
         }
@@ -292,10 +292,43 @@ fn append_detail_metadata(lines: &mut Vec<Line<'_>>, details: &EntryDetails) {
     }
     if let Some(published_at) = details.published_at {
         lines.push(Line::from(format!("Age: {}", relative_age(published_at))));
+        lines.push(Line::from(format!(
+            "Published: {}",
+            absolute_utc(published_at)
+        )));
     }
     if let Some(comment_count) = details.comment_count {
         lines.push(Line::from(format!("Comments: {comment_count}")));
     }
+}
+
+fn render_rich_text(text: &RichText) -> Vec<Line<'static>> {
+    text.lines
+        .iter()
+        .map(|line| {
+            Line::from(
+                line.spans
+                    .iter()
+                    .map(|span| {
+                        let mut style = Style::default();
+                        if span.style.emphasis {
+                            style = style.add_modifier(Modifier::ITALIC);
+                        }
+                        if span.style.strong {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                        if span.style.code {
+                            style = style.fg(Color::Cyan);
+                        }
+                        if span.style.link {
+                            style = style.add_modifier(Modifier::UNDERLINED);
+                        }
+                        Span::styled(span.text.clone(), style)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
 }
 
 fn metadata(details: &EntryDetails) -> String {
@@ -350,6 +383,10 @@ fn relative_age(published_at: SystemTime) -> String {
     } else {
         quantity(seconds / (365 * 24 * 60 * 60), "year")
     }
+}
+
+fn absolute_utc(published_at: SystemTime) -> String {
+    httpdate::fmt_http_date(published_at).replace("GMT", "UTC")
 }
 
 fn cache_age(age: Duration) -> String {

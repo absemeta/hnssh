@@ -908,6 +908,117 @@ async fn live_feed_loads_progressively_in_upstream_order_with_bounded_item_work(
 }
 
 #[tokio::test]
+async fn visitor_reads_safe_rich_live_content_and_only_validated_links() -> TestResult {
+    let mut routes = HashMap::new();
+    routes.insert("topstories".to_owned(), vec![FakeReply::json("[1]")]);
+    routes.insert(
+        "item/1".to_owned(),
+        vec![FakeReply::json(
+            r##"{"id":1,"type":"story","title":"Safe &amp; <em>sound</em>\u001b[31m\u202e","url":"https://example.com/story?x=1&y=2","score":42,"by":"author","time":1700000000,"descendants":7,"text":"<p>Hello <em>world</em> &amp; <strong>friends</strong>.<br>Next line with <code>let x = 1;</code> and <a href=\"https://docs.example/path?q=1&amp;x=2\">docs</a>.</p><pre>fn main() {\n\tprintln!(\"safe\");\n}</pre><p><marquee>Unknown kept</marquee><script>HIDDEN_SCRIPT</script><style>HIDDEN_STYLE</style><a href=\"javascript:alert(1)\">unsafe js</a><a href=\"https://visitor:secret@example.net/private\">unsafe credentials</a></p>"}"##,
+        )],
+    );
+    let fake = FakeHackerNews::start(routes).await?;
+    let content = Arc::new(HackerNewsContent::for_endpoint(fake.endpoint()));
+    let server = TestServer::start_with_content(content).await?;
+    let (connection, mut channel, mut terminal, mut raw_output) = open_terminal(&server).await?;
+
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Safe & sound").await?;
+    let feed = terminal.screen().contents();
+    assert!(!feed.contains("<em>"));
+    assert!(!feed.contains("[31m"));
+
+    channel.data_bytes(&b"\r"[..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Unknown kept").await?;
+    let detail = terminal.screen().contents();
+    for expected in [
+        "Hello world & friends.",
+        "Next line with let x = 1; and docs.",
+        "fn main() {",
+        "println!(\"safe\");",
+        "Unknown kept",
+        "Published: Tue, 14 Nov 2023 22:13:20 UTC",
+    ] {
+        assert!(
+            detail.contains(expected),
+            "detail did not contain {expected:?}"
+        );
+    }
+    assert!(!detail.contains("HIDDEN_SCRIPT"));
+    assert!(!detail.contains("HIDDEN_STYLE"));
+
+    channel.data_bytes(&b"\r"[..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Entry links").await?;
+    let links = terminal.screen().contents();
+    assert!(links.contains("https://example.com/story?x=1&y=2"));
+    assert!(links.contains("https://docs.example/path?q=1&x=2"));
+    assert!(!links.contains("javascript:"));
+    assert!(!links.contains("visitor:secret"));
+
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut raw_output).await?, 0);
+    connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await?;
+    fake.stop().await
+}
+
+#[tokio::test]
+async fn visitor_reads_live_poll_options_with_partial_failures() -> TestResult {
+    let mut routes = HashMap::new();
+    routes.insert("topstories".to_owned(), vec![FakeReply::json("[10]")]);
+    routes.insert(
+        "item/10".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":10,"type":"poll","title":"Choose safely","parts":[11,12,13]}"#,
+        )],
+    );
+    routes.insert(
+        "item/11".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":11,"type":"pollopt","text":"First &amp; <em>best</em>","score":12}"#,
+        )],
+    );
+    routes.insert("item/12".to_owned(), vec![FakeReply::json("null")]);
+    routes.insert(
+        "item/13".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":13,"type":"pollopt","text":"<strong>Still usable</strong>","score":1}"#,
+        )],
+    );
+    let fake = FakeHackerNews::start(routes).await?;
+    let content = Arc::new(HackerNewsContent::for_endpoint(fake.endpoint()));
+    let server = TestServer::start_with_content(content).await?;
+    let (connection, mut channel, mut terminal, mut raw_output) = open_terminal(&server).await?;
+
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Choose safely",
+    )
+    .await?;
+    channel.data_bytes(&b"\r"[..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Still usable").await?;
+    let detail = terminal.screen().contents();
+    assert!(detail.contains("First & best — 12 points"));
+    assert!(detail.contains("Still usable — 1 point"));
+    assert_eq!(fake.request_count("item/11"), 1);
+    assert_eq!(fake.request_count("item/12"), 1);
+    assert_eq!(fake.request_count("item/13"), 1);
+
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut raw_output).await?, 0);
+    connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await?;
+    fake.stop().await
+}
+
+#[tokio::test]
 async fn concurrent_sessions_share_live_feed_and_item_requests() -> TestResult {
     let mut routes = HashMap::new();
     routes.insert(

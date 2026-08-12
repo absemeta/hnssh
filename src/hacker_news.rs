@@ -4,15 +4,16 @@ use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use reqwest::{Client, Response, StatusCode, Url, header};
+use reqwest::{Client, Response, StatusCode, header};
 use serde::Deserialize;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::time::{Instant, sleep};
 
 use crate::content::{
     ContentError, ContentFreshness, ContentFuture, ContentSnapshot, ContentSource, EntryDetails,
-    FeedEntry, FeedEntryId,
+    FeedEntry, FeedEntryId, Link, PollOption, RichText,
 };
+use crate::content_safety::{normalize_html, normalize_title, validated_url};
 
 const PRODUCTION_ENDPOINT: &str = "https://hacker-news.firebaseio.com/v0";
 
@@ -132,38 +133,80 @@ impl HackerNewsContent {
         })
     }
 
+    async fn item_request(
+        &self,
+        id: FeedEntryId,
+        request: CacheRequest,
+    ) -> Result<ContentSnapshot<ResourceValue>, ContentError> {
+        let client = self.client.clone();
+        let limit = Arc::clone(&self.upstream_limit);
+        let options = Arc::clone(&self.options);
+        let url = format!("{}/item/{id}.json", self.endpoint);
+        let policy = CachePolicy {
+            fresh_for: self.options.item_fresh_for,
+            stale_for: self.options.item_stale_for,
+        };
+        self.cache
+            .read(ResourceKey::Item(id), policy, request, async move {
+                let item: Option<UpstreamItem> =
+                    fetch_json(&client, &limit, &url, &options).await?;
+                let fresh_for = item.as_ref().map_or(options.item_fresh_for, |item| {
+                    item.cache_fresh_for(&options)
+                });
+                let item = item.map_or_else(
+                    || {
+                        Ok(CachedItem {
+                            entry: FeedEntry::Unavailable { id },
+                            poll_option: None,
+                            poll_option_ids: Vec::new(),
+                        })
+                    },
+                    |item| item.into_cached_item(id),
+                )?;
+                Ok(ResourceValue::Item {
+                    item: Box::new(item),
+                    fresh_for,
+                })
+            })
+            .await
+    }
+
     fn feed_entry_request(
         &self,
         id: FeedEntryId,
         request: CacheRequest,
     ) -> ContentFuture<'_, Result<ContentSnapshot<FeedEntry>, ContentError>> {
         Box::pin(async move {
-            let client = self.client.clone();
-            let limit = Arc::clone(&self.upstream_limit);
-            let options = Arc::clone(&self.options);
-            let url = format!("{}/item/{id}.json", self.endpoint);
-            let policy = CachePolicy {
-                fresh_for: self.options.item_fresh_for,
-                stale_for: self.options.item_stale_for,
-            };
-            let snapshot = self
-                .cache
-                .read(ResourceKey::Item(id), policy, request, async move {
-                    let item: Option<UpstreamItem> =
-                        fetch_json(&client, &limit, &url, &options).await?;
-                    let fresh_for = item.as_ref().map_or(options.item_fresh_for, |item| {
-                        item.cache_fresh_for(&options)
-                    });
-                    let entry = item.map_or(Ok(FeedEntry::Unavailable { id }), |item| {
-                        item.into_feed_entry(id)
-                    })?;
-                    Ok(ResourceValue::Item { entry, fresh_for })
-                })
-                .await?;
-            snapshot.try_map(|resource| match resource {
-                ResourceValue::Item { entry, .. } => Ok(entry),
+            let snapshot = self.item_request(id, request).await?;
+            let mut poll_option_ids = Vec::new();
+            let mut entry = snapshot.try_map(|resource| match resource {
+                ResourceValue::Item { item, .. } => {
+                    poll_option_ids = item.poll_option_ids;
+                    Ok(item.entry)
+                }
                 ResourceValue::TopFeed(_) => Err(ContentError::Unavailable),
-            })
+            })?;
+
+            if let FeedEntry::Poll { options, .. } = &mut entry.value {
+                for option_id in poll_option_ids {
+                    let option = self
+                        .item_request(option_id, request)
+                        .await
+                        .and_then(|snapshot| {
+                            snapshot.try_map(|resource| match resource {
+                                ResourceValue::Item { item, .. } => {
+                                    item.poll_option.ok_or(ContentError::Unavailable)
+                                }
+                                ResourceValue::TopFeed(_) => Err(ContentError::Unavailable),
+                            })
+                        });
+                    if let Ok(option) = option {
+                        options.push(option.value);
+                    }
+                }
+            }
+
+            Ok(entry)
         })
     }
 }
@@ -211,7 +254,18 @@ struct UpstreamItem {
     score: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     title: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    text: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_ids")]
+    parts: Option<Vec<FeedEntryId>>,
     descendants: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedItem {
+    entry: FeedEntry,
+    poll_option: Option<PollOption>,
+    poll_option_ids: Vec<FeedEntryId>,
 }
 
 impl UpstreamItem {
@@ -223,34 +277,71 @@ impl UpstreamItem {
         }
     }
 
-    fn into_feed_entry(self, requested_id: FeedEntryId) -> Result<FeedEntry, ContentError> {
+    fn into_cached_item(self, requested_id: FeedEntryId) -> Result<CachedItem, ContentError> {
         if self.id.is_some_and(|id| id != requested_id) {
             return Err(ContentError::Unavailable);
         }
         if self.dead == Some(true) || self.deleted == Some(true) {
-            return Ok(FeedEntry::Unavailable { id: requested_id });
+            return Ok(CachedItem {
+                entry: FeedEntry::Unavailable { id: requested_id },
+                poll_option: None,
+                poll_option_ids: Vec::new(),
+            });
         }
 
         let Some(item_type) = self.item_type else {
-            return Ok(FeedEntry::Unavailable { id: requested_id });
+            return Ok(CachedItem {
+                entry: FeedEntry::Unavailable { id: requested_id },
+                poll_option: None,
+                poll_option_ids: Vec::new(),
+            });
         };
+        let title = self.title.as_deref().and_then(normalize_title);
+        let author = self.by.as_deref().and_then(normalize_title);
+        let normalized_text = self.text.as_deref().map(normalize_html);
+        let text = normalized_text
+            .as_ref()
+            .map(|content| content.text.clone())
+            .filter(|text| !text.lines.is_empty());
+        let valid_url = self.url.as_deref().and_then(validated_url);
+        let source = valid_url.as_deref().and_then(url_source);
+        let mut links = Vec::new();
+        if let Some(destination) = valid_url {
+            links.push(Link::new(
+                title.clone().unwrap_or_else(|| destination.clone()),
+                destination,
+            ));
+        }
+        if let Some(content) = normalized_text {
+            links.extend(content.links);
+        }
         let details = EntryDetails {
             id: requested_id,
-            source: self.url.as_deref().and_then(url_source),
-            // Rich text and links remain hidden until the content-safety slice
-            // validates and normalizes them for terminal output.
-            links: Vec::new(),
-            title: self.title.map(|title| terminal_safe_text(&title)),
+            source,
+            links,
+            title: title.clone(),
             score: self.score,
-            author: self.by.map(|author| terminal_safe_text(&author)),
-            published_at: self.time.and_then(|seconds| {
-                SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
-            }),
+            author,
+            published_at: self.time.and_then(upstream_timestamp),
             comment_count: self.descendants,
-            text: None,
+            text,
+        };
+        let poll_option = (item_type == "pollopt").then(|| {
+            self.text
+                .as_deref()
+                .and_then(normalize_title)
+                .map(|text| PollOption {
+                    text,
+                    score: self.score,
+                })
+        });
+        let poll_option_ids = if item_type == "poll" {
+            self.parts.unwrap_or_default()
+        } else {
+            Vec::new()
         };
 
-        Ok(match item_type.as_str() {
+        let entry = match item_type.as_str() {
             "story" => FeedEntry::Story(details),
             "job" => FeedEntry::Job(details),
             "poll" => FeedEntry::Poll {
@@ -260,8 +351,13 @@ impl UpstreamItem {
             _ => FeedEntry::Unsupported {
                 id: requested_id,
                 item_type,
-                title: details.title,
+                title,
             },
+        };
+        Ok(CachedItem {
+            entry,
+            poll_option: poll_option.flatten(),
+            poll_option_ids,
         })
     }
 }
@@ -283,25 +379,35 @@ where
     })
 }
 
-fn terminal_safe_text(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| {
-            !character.is_control()
-                && !matches!(
-                    character,
-                    '\u{061c}'
-                        | '\u{200e}'
-                        | '\u{200f}'
-                        | '\u{202a}'..='\u{202e}'
-                        | '\u{2066}'..='\u{2069}'
-                )
-        })
-        .collect()
+fn deserialize_optional_ids<'de, D>(deserializer: D) -> Result<Option<Vec<FeedEntryId>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IdsOrOther {
+        Ids(Vec<FeedEntryId>),
+        Other(serde::de::IgnoredAny),
+    }
+
+    Ok(match Option::<IdsOrOther>::deserialize(deserializer)? {
+        Some(IdsOrOther::Ids(ids)) => Some(ids),
+        Some(IdsOrOther::Other(_)) | None => None,
+    })
 }
 
 fn url_source(value: &str) -> Option<String> {
-    Url::parse(value).ok()?.host_str().map(str::to_owned)
+    reqwest::Url::parse(value)
+        .ok()?
+        .host_str()
+        .map(str::to_owned)
+}
+
+fn upstream_timestamp(seconds: u64) -> Option<SystemTime> {
+    const LAST_SUPPORTED_SECOND: u64 = 253_402_300_799;
+    (seconds <= LAST_SUPPORTED_SECOND)
+        .then(|| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+        .flatten()
 }
 
 async fn fetch_json<T>(
@@ -406,7 +512,7 @@ enum ResourceKey {
 enum ResourceValue {
     TopFeed(Vec<FeedEntryId>),
     Item {
-        entry: FeedEntry,
+        item: Box<CachedItem>,
         fresh_for: Duration,
     },
 }
@@ -415,9 +521,18 @@ impl ResourceValue {
     fn estimated_weight(&self) -> usize {
         match self {
             Self::TopFeed(ids) => 64usize.saturating_add(ids.len().saturating_mul(8)),
-            Self::Item { entry, .. } => feed_entry_weight(entry),
+            Self::Item { item, .. } => cached_item_weight(item),
         }
     }
+}
+
+fn cached_item_weight(item: &CachedItem) -> usize {
+    let mut weight =
+        feed_entry_weight(&item.entry).saturating_add(item.poll_option_ids.len().saturating_mul(8));
+    if let Some(option) = &item.poll_option {
+        weight = weight.saturating_add(option.text.len()).saturating_add(16);
+    }
+    weight
 }
 
 fn feed_entry_weight(entry: &FeedEntry) -> usize {
@@ -427,12 +542,14 @@ fn feed_entry_weight(entry: &FeedEntry) -> usize {
             details.title.as_deref(),
             details.source.as_deref(),
             details.author.as_deref(),
-            details.text.as_deref(),
         ]
         .into_iter()
         .flatten()
         {
             weight = weight.saturating_add(value.len());
+        }
+        if let Some(text) = &details.text {
+            weight = weight.saturating_add(rich_text_weight(text));
         }
         for link in &details.links {
             weight = weight
@@ -457,6 +574,14 @@ fn feed_entry_weight(entry: &FeedEntry) -> usize {
         FeedEntry::Story(_) | FeedEntry::Job(_) | FeedEntry::Unavailable { .. } => {}
     }
     weight
+}
+
+fn rich_text_weight(text: &RichText) -> usize {
+    text.lines.iter().fold(0usize, |weight, line| {
+        line.spans.iter().fold(weight, |weight, span| {
+            weight.saturating_add(span.text.len()).saturating_add(8)
+        })
+    })
 }
 
 #[derive(Clone, Copy)]

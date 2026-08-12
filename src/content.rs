@@ -147,6 +147,58 @@ impl Link {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RichTextStyle {
+    pub emphasis: bool,
+    pub strong: bool,
+    pub code: bool,
+    pub link: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RichTextSpan {
+    pub text: String,
+    pub style: RichTextStyle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RichTextLine {
+    pub spans: Vec<RichTextSpan>,
+    pub preformatted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RichText {
+    pub lines: Vec<RichTextLine>,
+}
+
+impl RichText {
+    pub(crate) fn plain(value: impl Into<String>) -> Self {
+        Self {
+            lines: vec![RichTextLine {
+                spans: vec![RichTextSpan {
+                    text: value.into(),
+                    style: RichTextStyle::default(),
+                }],
+                preformatted: false,
+            }],
+        }
+    }
+
+    pub fn plain_text(&self) -> String {
+        self.lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntryDetails {
     pub id: FeedEntryId,
@@ -156,7 +208,7 @@ pub struct EntryDetails {
     pub author: Option<String>,
     pub published_at: Option<SystemTime>,
     pub comment_count: Option<u32>,
-    pub text: Option<String>,
+    pub text: Option<RichText>,
     pub links: Vec<Link>,
 }
 
@@ -284,7 +336,7 @@ impl FixtureContent {
                 author: None,
                 published_at: ago(now, Duration::from_secs(3 * 60 * 60)),
                 comment_count: None,
-                text: Some("Build calm tools for noisy systems.".to_owned()),
+                text: Some(RichText::plain("Build calm tools for noisy systems.")),
                 links: vec![Link::new(
                     "Acme careers",
                     "https://jobs.example.com/terminal-engineer",
@@ -479,7 +531,7 @@ fn story(
         author: Some(metadata.author.to_owned()),
         published_at: metadata.published_at,
         comment_count: Some(metadata.comment_count),
-        text: text.map(str::to_owned),
+        text: text.map(RichText::plain),
         links,
     })
 }
