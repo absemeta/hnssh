@@ -11,11 +11,12 @@ use tokio::time::{Instant, sleep};
 
 use crate::content::{
     ContentError, ContentFreshness, ContentFuture, ContentSnapshot, ContentSource, EntryDetails,
-    FeedEntry, FeedEntryId, Link, PollOption, RichText,
+    FeedEntry, FeedEntryId, Link, PollOption, PollOptionStatus, RichText,
 };
-use crate::content_safety::{normalize_html, normalize_title, validated_url};
+use crate::content_safety::{normalize_html, normalize_inline_text, validated_url};
 
 const PRODUCTION_ENDPOINT: &str = "https://hacker-news.firebaseio.com/v0";
+const MAX_POLL_OPTIONS: usize = 64;
 
 /// Resource, retry, and cache bounds for the Hacker News adapter.
 #[derive(Clone, Debug)]
@@ -154,13 +155,7 @@ impl HackerNewsContent {
                     item.cache_fresh_for(&options)
                 });
                 let item = item.map_or_else(
-                    || {
-                        Ok(CachedItem {
-                            entry: FeedEntry::Unavailable { id },
-                            poll_option: None,
-                            poll_option_ids: Vec::new(),
-                        })
-                    },
+                    || Ok(CachedItem::unavailable(id)),
                     |item| item.into_cached_item(id),
                 )?;
                 Ok(ResourceValue::Item {
@@ -179,9 +174,11 @@ impl HackerNewsContent {
         Box::pin(async move {
             let snapshot = self.item_request(id, request).await?;
             let mut poll_option_ids = Vec::new();
+            let mut poll_options_truncated = false;
             let mut entry = snapshot.try_map(|resource| match resource {
                 ResourceValue::Item { item, .. } => {
                     poll_option_ids = item.poll_option_ids;
+                    poll_options_truncated = item.poll_options_truncated;
                     Ok(item.entry)
                 }
                 ResourceValue::TopFeed(_) => Err(ContentError::Unavailable),
@@ -189,20 +186,32 @@ impl HackerNewsContent {
 
             if let FeedEntry::Poll { options, .. } = &mut entry.value {
                 for option_id in poll_option_ids {
-                    let option = self
-                        .item_request(option_id, request)
-                        .await
-                        .and_then(|snapshot| {
-                            snapshot.try_map(|resource| match resource {
-                                ResourceValue::Item { item, .. } => {
-                                    item.poll_option.ok_or(ContentError::Unavailable)
-                                }
-                                ResourceValue::TopFeed(_) => Err(ContentError::Unavailable),
-                            })
-                        });
-                    if let Ok(option) = option {
-                        options.push(option.value);
+                    match self.item_request(option_id, request).await {
+                        Ok(snapshot) => {
+                            let freshness = snapshot.freshness;
+                            let age = snapshot.current_age();
+                            let mut option = match snapshot.value {
+                                ResourceValue::Item { item, .. } => item.poll_option,
+                                ResourceValue::TopFeed(_) => None,
+                            }
+                            .unwrap_or_else(|| {
+                                PollOption::placeholder(PollOptionStatus::Unavailable)
+                            });
+                            if freshness.is_stale() {
+                                option.status = PollOptionStatus::Stale { age };
+                            }
+                            options.push(option);
+                        }
+                        Err(ContentError::Retryable) => {
+                            options.push(PollOption::placeholder(PollOptionStatus::Retryable))
+                        }
+                        Err(ContentError::Unavailable) => {
+                            options.push(PollOption::placeholder(PollOptionStatus::Unavailable))
+                        }
                     }
+                }
+                if poll_options_truncated {
+                    options.push(PollOption::placeholder(PollOptionStatus::LimitReached));
                 }
             }
 
@@ -266,6 +275,18 @@ struct CachedItem {
     entry: FeedEntry,
     poll_option: Option<PollOption>,
     poll_option_ids: Vec<FeedEntryId>,
+    poll_options_truncated: bool,
+}
+
+impl CachedItem {
+    fn unavailable(id: FeedEntryId) -> Self {
+        Self {
+            entry: FeedEntry::Unavailable { id },
+            poll_option: None,
+            poll_option_ids: Vec::new(),
+            poll_options_truncated: false,
+        }
+    }
 }
 
 impl UpstreamItem {
@@ -282,40 +303,34 @@ impl UpstreamItem {
             return Err(ContentError::Unavailable);
         }
         if self.dead == Some(true) || self.deleted == Some(true) {
-            return Ok(CachedItem {
-                entry: FeedEntry::Unavailable { id: requested_id },
-                poll_option: None,
-                poll_option_ids: Vec::new(),
-            });
+            return Ok(CachedItem::unavailable(requested_id));
         }
 
         let Some(item_type) = self.item_type else {
-            return Ok(CachedItem {
-                entry: FeedEntry::Unavailable { id: requested_id },
-                poll_option: None,
-                poll_option_ids: Vec::new(),
-            });
+            return Ok(CachedItem::unavailable(requested_id));
         };
-        let title = self.title.as_deref().and_then(normalize_title);
-        let author = self.by.as_deref().and_then(normalize_title);
+        let title = self.title.as_deref().and_then(normalize_inline_text);
+        let author = self.by.as_deref().and_then(normalize_inline_text);
         let normalized_text = self.text.as_deref().map(normalize_html);
         let text = normalized_text
             .as_ref()
             .map(|content| content.text.clone())
             .filter(|text| !text.lines.is_empty());
         let valid_url = self.url.as_deref().and_then(validated_url);
-        let source = valid_url.as_deref().and_then(url_source);
+        let source = valid_url.as_ref().and_then(|url| url.source.clone());
         let mut links = Vec::new();
-        if let Some(destination) = valid_url {
+        if let Some(url) = &valid_url {
             links.push(Link::new(
-                title.clone().unwrap_or_else(|| destination.clone()),
-                destination,
+                title.clone().unwrap_or_else(|| url.destination.clone()),
+                url.destination.clone(),
             ));
         }
+        let mut omitted_link_count = usize::from(self.url.is_some() && valid_url.is_none());
         if let Some(content) = normalized_text {
+            omitted_link_count = omitted_link_count.saturating_add(content.omitted_link_count);
             links.extend(content.links);
         }
-        let details = EntryDetails {
+        let mut details = EntryDetails {
             id: requested_id,
             source,
             links,
@@ -325,21 +340,30 @@ impl UpstreamItem {
             published_at: self.time.and_then(upstream_timestamp),
             comment_count: self.descendants,
             text,
+            omitted_link_count,
         };
+        if item_type == "job" {
+            details.score = None;
+            details.author = None;
+            details.comment_count = None;
+        }
         let poll_option = (item_type == "pollopt").then(|| {
             self.text
                 .as_deref()
-                .and_then(normalize_title)
+                .and_then(normalize_inline_text)
                 .map(|text| PollOption {
                     text,
                     score: self.score,
+                    status: PollOptionStatus::Available,
                 })
         });
-        let poll_option_ids = if item_type == "poll" {
+        let mut poll_option_ids = if item_type == "poll" {
             self.parts.unwrap_or_default()
         } else {
             Vec::new()
         };
+        let poll_options_truncated = poll_option_ids.len() > MAX_POLL_OPTIONS;
+        poll_option_ids.truncate(MAX_POLL_OPTIONS);
 
         let entry = match item_type.as_str() {
             "story" => FeedEntry::Story(details),
@@ -358,6 +382,7 @@ impl UpstreamItem {
             entry,
             poll_option: poll_option.flatten(),
             poll_option_ids,
+            poll_options_truncated,
         })
     }
 }
@@ -394,13 +419,6 @@ where
         Some(IdsOrOther::Ids(ids)) => Some(ids),
         Some(IdsOrOther::Other(_)) | None => None,
     })
-}
-
-fn url_source(value: &str) -> Option<String> {
-    reqwest::Url::parse(value)
-        .ok()?
-        .host_str()
-        .map(str::to_owned)
 }
 
 fn upstream_timestamp(seconds: u64) -> Option<SystemTime> {

@@ -914,7 +914,7 @@ async fn visitor_reads_safe_rich_live_content_and_only_validated_links() -> Test
     routes.insert(
         "item/1".to_owned(),
         vec![FakeReply::json(
-            r##"{"id":1,"type":"story","title":"Safe &amp; <em>sound</em>\u001b[31m\u202e","url":"https://example.com/story?x=1&y=2","score":42,"by":"author","time":1700000000,"descendants":7,"text":"<p>Hello <em>world</em> &amp; <strong>friends</strong>.<br>Next line with <code>let x = 1;</code> and <a href=\"https://docs.example/path?q=1&amp;x=2\">docs</a>.</p><pre>fn main() {\n\tprintln!(\"safe\");\n}</pre><p><marquee>Unknown kept</marquee><script>HIDDEN_SCRIPT</script><style>HIDDEN_STYLE</style><a href=\"javascript:alert(1)\">unsafe js</a><a href=\"https://visitor:secret@example.net/private\">unsafe credentials</a></p>"}"##,
+            r##"{"id":1,"type":"story","title":"Safe &amp; <em>sound</em>\u001b[31m\u202e","url":"https://example.com/story?x=1&y=2","score":42,"by":"author","time":1700000000,"descendants":7,"text":"<p>Hello <em>world</em> &amp; <strong>friends</strong>.<br>Next line with <code>let x = 1;</code> and <a href=\"https://docs.example/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\">docs</a>.</p><pre>fn main() {\n\tprintln!(\"safe\");\n}</pre><p><marquee>Unknown kept</marquee><script>HIDDEN_SCRIPT</script><style>HIDDEN_STYLE</style><a href=\"javascript:alert(1)\">unsafe js</a><a href=\"https://visitor:secret@example.net/private\">unsafe credentials</a></p>"}"##,
         )],
     );
     let fake = FakeHackerNews::start(routes).await?;
@@ -945,12 +945,20 @@ async fn visitor_reads_safe_rich_live_content_and_only_validated_links() -> Test
     }
     assert!(!detail.contains("HIDDEN_SCRIPT"));
     assert!(!detail.contains("HIDDEN_STYLE"));
+    assert!(detail.contains("Unsafe or malformed links omitted: 2"));
 
     channel.data_bytes(&b"\r"[..]).await?;
     read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Entry links").await?;
     let links = terminal.screen().contents();
     assert!(links.contains("https://example.com/story?x=1&y=2"));
-    assert!(links.contains("https://docs.example/path?q=1&x=2"));
+    let long_destination = "https://docs.example/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let compact_links = links
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace() && !matches!(character, '│' | '┌' | '┐' | '└' | '┘' | '─')
+        })
+        .collect::<String>();
+    assert!(compact_links.contains(long_destination));
     assert!(!links.contains("javascript:"));
     assert!(!links.contains("visitor:secret"));
 
@@ -967,7 +975,7 @@ async fn visitor_reads_safe_rich_live_content_and_only_validated_links() -> Test
 #[tokio::test]
 async fn visitor_reads_live_poll_options_with_partial_failures() -> TestResult {
     let mut routes = HashMap::new();
-    routes.insert("topstories".to_owned(), vec![FakeReply::json("[10]")]);
+    routes.insert("topstories".to_owned(), vec![FakeReply::json("[10,20]")]);
     routes.insert(
         "item/10".to_owned(),
         vec![FakeReply::json(
@@ -987,6 +995,12 @@ async fn visitor_reads_live_poll_options_with_partial_failures() -> TestResult {
             r#"{"id":13,"type":"pollopt","text":"<strong>Still usable</strong>","score":1}"#,
         )],
     );
+    routes.insert(
+        "item/20".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":20,"type":"job","title":"Maintenance role","url":"https://jobs.example/role","score":99,"by":"should-not-show","descendants":88,"time":18446744073709551615,"text":"Build reliable systems."}"#,
+        )],
+    );
     let fake = FakeHackerNews::start(routes).await?;
     let content = Arc::new(HackerNewsContent::for_endpoint(fake.endpoint()));
     let server = TestServer::start_with_content(content).await?;
@@ -1003,10 +1017,29 @@ async fn visitor_reads_live_poll_options_with_partial_failures() -> TestResult {
     read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Still usable").await?;
     let detail = terminal.screen().contents();
     assert!(detail.contains("First & best — 12 points"));
+    assert!(detail.contains("[poll option unavailable] · not loaded"));
     assert!(detail.contains("Still usable — 1 point"));
     assert_eq!(fake.request_count("item/11"), 1);
     assert_eq!(fake.request_count("item/12"), 1);
     assert_eq!(fake.request_count("item/13"), 1);
+
+    channel.data_bytes(&[0x1b][..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Top feed").await?;
+    channel.data_bytes(&b"j"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "> 2. Maintenance role",
+    )
+    .await?;
+    channel.data_bytes(&b"\r"[..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Type: Job").await?;
+    let job = terminal.screen().contents();
+    assert!(!job.contains("Score:"));
+    assert!(!job.contains("Author:"));
+    assert!(!job.contains("Comments:"));
+    assert!(!job.contains("Published:"));
 
     channel.data_bytes(&b"q"[..]).await?;
     assert_eq!(read_through_close(&mut channel, &mut raw_output).await?, 0);

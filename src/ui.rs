@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::browser::{Browser, FeedRowState, FeedStatus, ViewKind};
-use crate::content::{ContentFreshness, EntryDetails, FeedEntry, RichText};
+use crate::content::{ContentFreshness, EntryDetails, FeedEntry, PollOptionStatus, RichText};
 
 pub(crate) const MIN_COLUMNS: u16 = 60;
 pub(crate) const MIN_ROWS: u16 = 16;
@@ -149,6 +149,13 @@ fn render_detail(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
             lines.push(Line::from(""));
             lines.extend(render_rich_text(text));
         }
+        if details.omitted_link_count > 0 {
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "Unsafe or malformed links omitted: {}",
+                details.omitted_link_count
+            )));
+        }
     }
     if let FeedEntry::Poll { options, .. } = entry {
         lines.push(Line::from(""));
@@ -158,7 +165,16 @@ fn render_detail(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
                 .score
                 .map(|score| format!(" — {}", points(score)))
                 .unwrap_or_default();
-            lines.push(Line::from(format!("• {}{score}", option.text)));
+            let status = match option.status {
+                PollOptionStatus::Available => String::new(),
+                PollOptionStatus::Stale { age } => {
+                    format!(" · stale · {} old", cache_age(age))
+                }
+                PollOptionStatus::Unavailable
+                | PollOptionStatus::Retryable
+                | PollOptionStatus::LimitReached => " · not loaded".to_owned(),
+            };
+            lines.push(Line::from(format!("• {}{score}{status}", option.text)));
         }
     }
     lines.push(Line::from(""));
@@ -216,7 +232,7 @@ fn render_links(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
         lines.push(Line::from(format!("  {}", link.destination)));
     }
 
-    let panel = Paragraph::new(lines).block(
+    let panel = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::default()
             .title(" HNSSH · Entry links ")
             .borders(Borders::ALL),
@@ -306,27 +322,27 @@ fn render_rich_text(text: &RichText) -> Vec<Line<'static>> {
     text.lines
         .iter()
         .map(|line| {
-            Line::from(
-                line.spans
-                    .iter()
-                    .map(|span| {
-                        let mut style = Style::default();
-                        if span.style.emphasis {
-                            style = style.add_modifier(Modifier::ITALIC);
-                        }
-                        if span.style.strong {
-                            style = style.add_modifier(Modifier::BOLD);
-                        }
-                        if span.style.code {
-                            style = style.fg(Color::Cyan);
-                        }
-                        if span.style.link {
-                            style = style.add_modifier(Modifier::UNDERLINED);
-                        }
-                        Span::styled(span.text.clone(), style)
-                    })
-                    .collect::<Vec<_>>(),
-            )
+            let mut spans = Vec::new();
+            if line.preformatted {
+                spans.push(Span::from("│ "));
+            }
+            spans.extend(line.spans.iter().map(|span| {
+                let mut style = Style::default();
+                if span.style.emphasis {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if span.style.strong {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if span.style.code {
+                    style = style.fg(Color::Cyan).add_modifier(Modifier::REVERSED);
+                }
+                if span.style.link {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                Span::styled(span.text.clone(), style)
+            }));
+            Line::from(spans)
         })
         .collect()
 }

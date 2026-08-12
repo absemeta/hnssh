@@ -210,12 +210,41 @@ pub struct EntryDetails {
     pub comment_count: Option<u32>,
     pub text: Option<RichText>,
     pub links: Vec<Link>,
+    pub omitted_link_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PollOptionStatus {
+    Available,
+    Stale { age: Duration },
+    Unavailable,
+    Retryable,
+    LimitReached,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PollOption {
     pub text: String,
     pub score: Option<u32>,
+    pub status: PollOptionStatus,
+}
+
+impl PollOption {
+    pub(crate) fn placeholder(status: PollOptionStatus) -> Self {
+        let text = match status {
+            PollOptionStatus::Unavailable => "[poll option unavailable]",
+            PollOptionStatus::Retryable => "[poll option temporarily unavailable]",
+            PollOptionStatus::LimitReached => "[poll option safety limit reached]",
+            PollOptionStatus::Available | PollOptionStatus::Stale { .. } => {
+                unreachable!("available poll options are not placeholders")
+            }
+        };
+        Self {
+            text: text.to_owned(),
+            score: None,
+            status,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -341,6 +370,7 @@ impl FixtureContent {
                     "Acme careers",
                     "https://jobs.example.com/terminal-engineer",
                 )],
+                omitted_link_count: 0,
             }),
             FeedEntry::Poll {
                 details: EntryDetails {
@@ -353,15 +383,18 @@ impl FixtureContent {
                     comment_count: Some(39),
                     text: None,
                     links: Vec::new(),
+                    omitted_link_count: 0,
                 },
                 options: vec![
                     PollOption {
                         text: "Escape".to_owned(),
                         score: Some(31),
+                        status: PollOptionStatus::Available,
                     },
                     PollOption {
                         text: "Control".to_owned(),
                         score: Some(24),
+                        status: PollOptionStatus::Available,
                     },
                 ],
             },
@@ -533,6 +566,7 @@ fn story(
         comment_count: Some(metadata.comment_count),
         text: text.map(RichText::plain),
         links,
+        omitted_link_count: 0,
     })
 }
 

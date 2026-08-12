@@ -6,32 +6,40 @@ use crate::content::{Link, RichText, RichTextLine, RichTextSpan, RichTextStyle};
 pub(crate) struct NormalizedContent {
     pub(crate) text: RichText,
     pub(crate) links: Vec<Link>,
+    pub(crate) omitted_link_count: usize,
+}
+
+pub(crate) struct ValidatedUrl {
+    pub(crate) destination: String,
+    pub(crate) source: Option<String>,
 }
 
 pub(crate) fn normalize_html(value: &str) -> NormalizedContent {
     let fragment = Html::parse_fragment(value);
     let mut builder = RichTextBuilder::default();
     let mut links = Vec::new();
+    let mut omitted_link_count = 0;
     walk_children(
         fragment.root_element(),
         RichTextStyle::default(),
         false,
         &mut builder,
         &mut links,
+        &mut omitted_link_count,
+        true,
     );
     NormalizedContent {
         text: builder.finish(),
         links,
+        omitted_link_count,
     }
 }
 
-pub(crate) fn normalize_title(value: &str) -> Option<String> {
-    let normalized = normalize_html(value).text.plain_text();
-    let title = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!title.is_empty()).then_some(title)
+pub(crate) fn normalize_inline_text(value: &str) -> Option<String> {
+    collapse_to_line(normalize_html(value).text)
 }
 
-pub(crate) fn validated_url(value: &str) -> Option<String> {
+pub(crate) fn validated_url(value: &str) -> Option<ValidatedUrl> {
     if value.chars().any(forbidden_url_character) {
         return None;
     }
@@ -44,7 +52,11 @@ pub(crate) fn validated_url(value: &str) -> Option<String> {
     {
         return None;
     }
-    Some(url.to_string())
+    let source = url.host_str().map(str::to_owned);
+    Some(ValidatedUrl {
+        destination: url.to_string(),
+        source,
+    })
 }
 
 fn forbidden_url_character(character: char) -> bool {
@@ -57,6 +69,8 @@ fn walk_children<'a>(
     preformatted: bool,
     builder: &mut RichTextBuilder,
     links: &mut Vec<Link>,
+    omitted_link_count: &mut usize,
+    collect_links: bool,
 ) {
     let mut actions = Vec::new();
     push_children(&mut actions, element, style, preformatted);
@@ -94,14 +108,16 @@ fn walk_children<'a>(
                     "em" | "i" => style.emphasis = true,
                     "strong" | "b" => style.strong = true,
                     "code" => style.code = true,
-                    "a" => {
-                        if let Some(destination) =
-                            element.value().attr("href").and_then(validated_url)
-                        {
-                            let label = normalized_link_label(element)
-                                .unwrap_or_else(|| destination.clone());
-                            links.push(Link::new(label, destination));
-                            style.link = true;
+                    "a" if collect_links => {
+                        if let Some(destination) = element.value().attr("href") {
+                            if let Some(destination) = validated_url(destination) {
+                                let label = normalized_link_label(element)
+                                    .unwrap_or_else(|| destination.destination.clone());
+                                links.push(Link::new(label, destination.destination));
+                                style.link = true;
+                            } else {
+                                *omitted_link_count = omitted_link_count.saturating_add(1);
+                            }
                         }
                     }
                     _ => {}
@@ -146,20 +162,26 @@ fn push_children<'a>(
 fn normalized_link_label(element: ElementRef<'_>) -> Option<String> {
     let mut builder = RichTextBuilder::default();
     let mut ignored_links = Vec::new();
+    let mut ignored_omissions = 0;
     walk_children(
         element,
         RichTextStyle::default(),
         false,
         &mut builder,
         &mut ignored_links,
+        &mut ignored_omissions,
+        false,
     );
-    let label = builder
-        .finish()
+    collapse_to_line(builder.finish())
+}
+
+fn collapse_to_line(text: RichText) -> Option<String> {
+    let line = text
         .plain_text()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    (!label.is_empty()).then_some(label)
+    (!line.is_empty()).then_some(line)
 }
 
 #[derive(Default)]
@@ -389,6 +411,7 @@ mod tests {
                 .any(|span| span.text == "safe" && span.style.link)
         );
         assert_eq!(normalized.links.len(), 1);
+        assert_eq!(normalized.omitted_link_count, 2);
         assert_eq!(
             normalized.links[0].destination,
             "https://example.com/?a=1&b=2"
@@ -401,5 +424,15 @@ mod tests {
 
         assert_eq!(normalized.text.plain_text(), "a    <b>\nred");
         assert!(normalized.text.lines.iter().all(|line| line.preformatted));
+    }
+
+    #[test]
+    fn tolerates_long_unicode_and_malformed_entities() {
+        let input = format!("<p>{} &bogus; &#x110000; 🦀</p>", "é".repeat(4_096));
+        let normalized = normalize_html(&input).text.plain_text();
+
+        assert!(normalized.starts_with(&"é".repeat(4_096)));
+        assert!(normalized.contains("🦀"));
+        assert!(!normalized.chars().any(is_bidi_control));
     }
 }
