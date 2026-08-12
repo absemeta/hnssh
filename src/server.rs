@@ -5,19 +5,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Rect};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::layout::Rect;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use russh::keys::{PrivateKey, load_secret_key};
 use russh::server::{self, Auth, Handler, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect, MethodSet, Pty};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinSet;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+
+use crate::browser::{Browser, CommandOutcome};
+use crate::content::{ContentError, ContentSource, FeedEntry, FeedEntryId, FixtureContent};
+use crate::input::{InputDecoder, Key};
+use crate::ui;
 
 const DEFAULT_SESSION_SIZE: TerminalSize = TerminalSize {
     columns: 80,
@@ -87,10 +91,18 @@ pub enum ServerError {
 pub struct Server {
     listener: TcpListener,
     ssh_config: Arc<server::Config>,
+    content: Arc<dyn ContentSource>,
 }
 
 impl Server {
     pub async fn bind(config: ServerConfig) -> Result<Self, ServerError> {
+        Self::bind_with_content(config, Arc::new(FixtureContent::default())).await
+    }
+
+    pub async fn bind_with_content(
+        config: ServerConfig,
+        content: Arc<dyn ContentSource>,
+    ) -> Result<Self, ServerError> {
         let host_key = load_secret_key(&config.host_key_path, None).map_err(|source| {
             ServerError::LoadHostKey {
                 path: config.host_key_path.clone(),
@@ -107,6 +119,7 @@ impl Server {
         Ok(Self {
             listener,
             ssh_config: ssh_config(host_key),
+            content,
         })
     }
 
@@ -127,9 +140,10 @@ impl Server {
                 accepted = self.listener.accept() => {
                     let (stream, _) = accepted.map_err(ServerError::Accept)?;
                     let ssh_config = Arc::clone(&self.ssh_config);
+                    let content = Arc::clone(&self.content);
                     let session_shutdown = shutdown.child_token();
                     sessions.spawn(async move {
-                        run_connection(ssh_config, stream, session_shutdown).await
+                        run_connection(ssh_config, stream, content, session_shutdown).await
                     });
                 }
             }
@@ -165,9 +179,10 @@ fn ssh_config(host_key: PrivateKey) -> Arc<server::Config> {
 async fn run_connection(
     config: Arc<server::Config>,
     stream: TcpStream,
+    content: Arc<dyn ContentSource>,
     shutdown: CancellationToken,
 ) -> Result<(), SessionError> {
-    let running = server::run_stream(config, stream, BrowsingSession::default()).await?;
+    let running = server::run_stream(config, stream, BrowsingSession::new(content)).await?;
     let handle = running.handle();
     tokio::pin!(running);
 
@@ -197,8 +212,6 @@ fn report_session_result(joined: Result<Result<(), SessionError>, tokio::task::J
 enum SessionError {
     #[error("SSH protocol error")]
     Ssh(#[from] russh::Error),
-    #[error("terminal rendering error")]
-    Terminal(#[from] io::Error),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,6 +231,10 @@ impl TerminalSize {
     fn area(self) -> Rect {
         Rect::new(0, 0, self.columns, self.rows)
     }
+
+    fn page_len(self) -> usize {
+        ui::page_len(self.rows)
+    }
 }
 
 fn clamp_dimension(value: u32, previous: u16, maximum: u16) -> u16 {
@@ -228,17 +245,194 @@ fn clamp_dimension(value: u32, previous: u16, maximum: u16) -> u16 {
     }
 }
 
-#[derive(Default)]
+enum ActorEvent {
+    TopFeed(Result<Vec<FeedEntryId>, ContentError>),
+    FeedEntry {
+        index: usize,
+        id: FeedEntryId,
+        result: Result<FeedEntry, ContentError>,
+    },
+    Input(Key),
+    Resize(TerminalSize),
+    Stop,
+}
+
+#[derive(Debug, Error)]
+enum ActorError {
+    #[error("terminal rendering error")]
+    Terminal(#[from] io::Error),
+    #[error("SSH output channel closed")]
+    OutputClosed,
+}
+
+struct SessionActor {
+    channel: ChannelId,
+    size: TerminalSize,
+    source: Arc<dyn ContentSource>,
+    browser: Browser,
+    terminal: RemoteTerminal,
+    output: OutputBuffer,
+    handle: server::Handle,
+}
+
+impl SessionActor {
+    fn new(
+        channel: ChannelId,
+        size: TerminalSize,
+        source: Arc<dyn ContentSource>,
+        handle: server::Handle,
+    ) -> Result<Self, ActorError> {
+        let output = OutputBuffer::default();
+        let backend = CrosstermBackend::new(output.clone());
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(size.area()),
+            },
+        )?;
+
+        Ok(Self {
+            channel,
+            size,
+            source,
+            browser: Browser::new(),
+            terminal,
+            output,
+            handle,
+        })
+    }
+
+    async fn run(
+        mut self,
+        mut events: UnboundedReceiver<ActorEvent>,
+        event_sender: UnboundedSender<ActorEvent>,
+    ) -> Result<(), ActorError> {
+        self.render().await?;
+        self.load_top_feed(event_sender.clone());
+
+        while let Some(event) = events.recv().await {
+            match event {
+                ActorEvent::TopFeed(result) => {
+                    let ids = result.as_ref().ok().cloned();
+                    self.browser.set_top_feed(result);
+                    self.render().await?;
+                    if let Some(ids) = ids {
+                        self.load_entries(ids, &event_sender);
+                    }
+                }
+                ActorEvent::FeedEntry { index, id, result } => {
+                    self.browser.set_feed_entry(index, id, result);
+                    self.render().await?;
+                }
+                ActorEvent::Input(key) => {
+                    match self.browser.handle_key(key, self.size.page_len()) {
+                        CommandOutcome::Redraw => self.render().await?,
+                        CommandOutcome::Unchanged => {}
+                        CommandOutcome::Quit => {
+                            self.finish().await;
+                            return Ok(());
+                        }
+                    }
+                }
+                ActorEvent::Resize(size) => {
+                    self.size = size;
+                    self.terminal.resize(size.area())?;
+                    self.render().await?;
+                }
+                ActorEvent::Stop => return Ok(()),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn load_top_feed(&self, events: UnboundedSender<ActorEvent>) {
+        let source = Arc::clone(&self.source);
+        tokio::spawn(async move {
+            let result = source.top_feed().await;
+            let _ = events.send(ActorEvent::TopFeed(result));
+        });
+    }
+
+    fn load_entries(&self, ids: Vec<FeedEntryId>, events: &UnboundedSender<ActorEvent>) {
+        for (index, id) in ids.into_iter().enumerate() {
+            let source = Arc::clone(&self.source);
+            let events = events.clone();
+            tokio::spawn(async move {
+                let result = source.feed_entry(id).await;
+                let _ = events.send(ActorEvent::FeedEntry { index, id, result });
+            });
+        }
+    }
+
+    async fn render(&mut self) -> Result<(), ActorError> {
+        let browser = &self.browser;
+        let size = self.size.area();
+        self.terminal
+            .draw(|frame| ui::render(frame, browser, size))?;
+        let output = self.output.take()?;
+        if !output.is_empty() {
+            self.handle
+                .data(self.channel, output)
+                .await
+                .map_err(|_| ActorError::OutputClosed)?;
+        }
+        Ok(())
+    }
+
+    async fn finish(&mut self) {
+        let _ = self.handle.data(self.channel, LEAVE_SCREEN.to_vec()).await;
+        let _ = self.handle.exit_status_request(self.channel, 0).await;
+        let _ = self.handle.eof(self.channel).await;
+        let _ = self.handle.close(self.channel).await;
+    }
+}
+
+fn spawn_session_actor(
+    channel: ChannelId,
+    size: TerminalSize,
+    source: Arc<dyn ContentSource>,
+    handle: server::Handle,
+) -> (UnboundedSender<ActorEvent>, JoinHandle<()>) {
+    let (event_sender, event_receiver) = unbounded_channel();
+    let actor_events = event_sender.clone();
+    let task = tokio::spawn(async move {
+        let result = match SessionActor::new(channel, size, source, handle) {
+            Ok(actor) => actor.run(event_receiver, actor_events).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            debug!(%error, "browsing session actor ended with an error");
+        }
+    });
+    (event_sender, task)
+}
+
 struct BrowsingSession {
     channel: Option<ChannelId>,
     pty_size: Option<TerminalSize>,
-    terminal: Option<RemoteTerminal>,
-    output: OutputBuffer,
     shell_started: bool,
     closed: bool,
+    content: Arc<dyn ContentSource>,
+    input: InputDecoder,
+    events: Option<UnboundedSender<ActorEvent>>,
+    actor: Option<JoinHandle<()>>,
 }
 
 impl BrowsingSession {
+    fn new(content: Arc<dyn ContentSource>) -> Self {
+        Self {
+            channel: None,
+            pty_size: None,
+            shell_started: false,
+            closed: false,
+            content,
+            input: InputDecoder::default(),
+            events: None,
+            actor: None,
+        }
+    }
+
     fn owns_channel(&self, channel: ChannelId) -> bool {
         self.channel == Some(channel)
     }
@@ -249,87 +443,51 @@ impl BrowsingSession {
         session: &mut Session,
     ) -> Result<(), SessionError> {
         let size = self.pty_size.unwrap_or(DEFAULT_SESSION_SIZE);
-        let backend = CrosstermBackend::new(self.output.clone());
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Fixed(size.area()),
-            },
-        )?;
-        self.terminal = Some(terminal);
         self.shell_started = true;
-
         session.data(channel, ENTER_SCREEN.to_vec())?;
-        self.render(channel, session)
-    }
-
-    fn render(&mut self, channel: ChannelId, session: &mut Session) -> Result<(), SessionError> {
-        let size = self.pty_size.unwrap_or(DEFAULT_SESSION_SIZE);
-        let Some(terminal) = self.terminal.as_mut() else {
-            return Ok(());
-        };
-
-        terminal.draw(|frame| {
-            let welcome = vec![
-                Line::from(""),
-                Line::from("Hacker News over SSH"),
-                Line::from(""),
-                Line::from("No account, password, or visitor key required."),
-                Line::from(format!("Terminal: {} x {}", size.columns, size.rows)),
-                Line::from(""),
-                Line::from("Press q to quit"),
-            ];
-            let panel = Paragraph::new(welcome)
-                .alignment(Alignment::Center)
-                .block(Block::default().title(" HNSSH ").borders(Borders::ALL));
-            frame.render_widget(panel, frame.area());
-        })?;
-
-        let output = self.output.take()?;
-        if !output.is_empty() {
-            session.data(channel, output)?;
-        }
+        let (events, actor) =
+            spawn_session_actor(channel, size, Arc::clone(&self.content), session.handle());
+        self.events = Some(events);
+        self.actor = Some(actor);
         Ok(())
     }
 
-    fn resize(
-        &mut self,
-        channel: ChannelId,
-        columns: u32,
-        rows: u32,
-        session: &mut Session,
-    ) -> Result<(), SessionError> {
-        let previous = self.pty_size.unwrap_or(DEFAULT_SESSION_SIZE);
-        let size = TerminalSize::from_protocol(columns, rows, previous);
+    fn resize(&mut self, size: TerminalSize) {
         self.pty_size = Some(size);
-
-        if let Some(terminal) = self.terminal.as_mut() {
-            terminal.resize(size.area())?;
-            self.render(channel, session)?;
+        if let Some(events) = &self.events {
+            let _ = events.send(ActorEvent::Resize(size));
         }
-        Ok(())
     }
 
-    fn finish(
+    fn finish_without_actor(
         &mut self,
         channel: ChannelId,
         status: u32,
-        restore_terminal: bool,
         session: &mut Session,
     ) -> Result<(), SessionError> {
         if self.closed {
             return Ok(());
         }
         self.closed = true;
-
-        if restore_terminal {
-            session.data(channel, LEAVE_SCREEN.to_vec())?;
-        }
         session.exit_status_request(channel, status)?;
         session.eof(channel)?;
         session.close(channel)?;
-        self.terminal = None;
         Ok(())
+    }
+
+    fn stop_actor(&mut self) {
+        if let Some(events) = self.events.take() {
+            let _ = events.send(ActorEvent::Stop);
+        }
+    }
+}
+
+impl Drop for BrowsingSession {
+    fn drop(&mut self) {
+        self.stop_actor();
+        if let Some(actor) = self.actor.take() {
+            actor.abort();
+        }
     }
 }
 
@@ -373,7 +531,8 @@ impl Handler for BrowsingSession {
             return Ok(());
         }
 
-        self.resize(channel, columns, rows, session)?;
+        let size = TerminalSize::from_protocol(columns, rows, DEFAULT_SESSION_SIZE);
+        self.resize(size);
         session.channel_success(channel)?;
         Ok(())
     }
@@ -391,7 +550,7 @@ impl Handler for BrowsingSession {
         session.channel_success(channel)?;
         if self.pty_size.is_none() {
             session.data(channel, PTY_REQUIRED_MESSAGE.to_vec())?;
-            return self.finish(channel, 1, false, session);
+            return self.finish_without_actor(channel, 1, session);
         }
 
         self.start_shell(channel, session)
@@ -411,7 +570,8 @@ impl Handler for BrowsingSession {
             return Ok(());
         }
 
-        self.resize(channel, columns, rows, session)?;
+        let previous = self.pty_size.unwrap_or(DEFAULT_SESSION_SIZE);
+        self.resize(TerminalSize::from_protocol(columns, rows, previous));
         session.channel_success(channel)?;
         Ok(())
     }
@@ -420,11 +580,16 @@ impl Handler for BrowsingSession {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        session: &mut Session,
+        _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if self.owns_channel(channel) && self.shell_started && !self.closed && data.contains(&b'q')
-        {
-            self.finish(channel, 0, true, session)?;
+        if !self.owns_channel(channel) || !self.shell_started || self.closed {
+            return Ok(());
+        }
+
+        if let Some(events) = &self.events {
+            for key in self.input.push(data) {
+                let _ = events.send(ActorEvent::Input(key));
+            }
         }
         Ok(())
     }
@@ -466,7 +631,7 @@ impl Handler for BrowsingSession {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if self.owns_channel(channel) {
-            self.terminal = None;
+            self.stop_actor();
         }
         Ok(())
     }
@@ -478,7 +643,7 @@ impl Handler for BrowsingSession {
     ) -> Result<(), Self::Error> {
         if self.owns_channel(channel) {
             self.closed = true;
-            self.terminal = None;
+            self.stop_actor();
         }
         Ok(())
     }

@@ -1,7 +1,7 @@
 # HNSSH
 
 HNSSH is an anonymously accessible, full-screen Hacker News browser served over SSH.
-The first runnable slice presents a Ratatui welcome screen and verifies the SSH and terminal lifecycle.
+The current runnable slice browses deterministic fixture feed entries, details, and links while the live Hacker News adapter is being built.
 
 ## Run locally
 
@@ -25,7 +25,7 @@ Then connect without a visitor password or key:
 ssh -p 2222 localhost
 ```
 
-Press `q` to quit. `HNSSH_LISTEN_ADDRESS` and `HNSSH_HOST_KEY` provide equivalent environment configuration.
+Use the arrow keys or `j`/`k` to move, Enter to inspect an entry, Escape or Backspace to return, `?` for help, and `q` to quit. `HNSSH_LISTEN_ADDRESS` and `HNSSH_HOST_KEY` provide equivalent environment configuration.
 
 The SSH client's first-connection host-authenticity prompt verifies the server and is distinct from visitor authentication. Keep the host key stable: HNSSH deliberately fails startup instead of generating or replacing a missing key.
 
@@ -37,4 +37,4 @@ A client must request an interactive PTY. If automatic PTY allocation is unavail
 cargo test
 ```
 
-The acceptance tests connect through a real SSH transport, apply server output to an emulated terminal, and verify anonymous authentication, PTY startup, resize, terminal restoration, clean exit, and the no-PTY error path.
+The acceptance tests connect through a real SSH transport, apply server output to an emulated terminal, and verify anonymous authentication, fixture loading, navigation, details, links, help, resize behavior, back-stack restoration, terminal restoration, clean exit, and the no-PTY error path.
