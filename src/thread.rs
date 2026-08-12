@@ -35,6 +35,7 @@ pub(crate) struct ThreadNode {
     parent: Option<usize>,
     depth: usize,
     state: ThreadNodeState,
+    refreshing: bool,
     expanded: bool,
     children: Option<SiblingGroup>,
 }
@@ -50,6 +51,10 @@ impl ThreadNode {
 
     pub(crate) fn expanded(&self) -> bool {
         self.expanded
+    }
+
+    pub(crate) fn refreshing(&self) -> bool {
+        self.refreshing
     }
 
     pub(crate) fn has_children(&self) -> bool {
@@ -250,6 +255,12 @@ impl CommentThread {
             return;
         }
 
+        let starts_revalidation = load.update == CommentUpdate::Initial
+            && result
+                .as_ref()
+                .is_ok_and(|snapshot| snapshot.freshness.is_stale());
+        node.refreshing = starts_revalidation;
+
         let preserve = load.update == CommentUpdate::Revalidation
             && result.is_err()
             && matches!(
@@ -365,9 +376,11 @@ impl CommentThread {
             return Vec::new();
         };
         let node = *node;
-        if matches!(self.nodes[node].state, ThreadNodeState::Loading) {
+        if self.nodes[node].refreshing || matches!(self.nodes[node].state, ThreadNodeState::Loading)
+        {
             return Vec::new();
         }
+        self.nodes[node].refreshing = true;
         vec![self.comment_load(node, CommentUpdate::Revalidation)]
     }
 
@@ -452,6 +465,7 @@ impl CommentThread {
                     },
                     depth,
                     state: ThreadNodeState::Loading,
+                    refreshing: false,
                     expanded: false,
                     children: None,
                 });
@@ -561,6 +575,21 @@ mod tests {
             row,
             ThreadRow::Marker { label, .. } if label == "[duplicate comment 1 omitted]"
         )));
+    }
+
+    #[test]
+    fn repeated_comment_refreshes_are_coalesced_until_the_result_arrives() {
+        let (mut thread, loads) = CommentThread::open(10_000, vec![1], 1);
+        thread.set_comment(loads[0], Ok(available(1, Vec::new())));
+
+        let (_, first_refresh) = thread.handle_key(Key::Refresh, 10);
+        let (_, duplicate_refresh) = thread.handle_key(Key::Refresh, 10);
+        assert_eq!(first_refresh.len(), 1);
+        assert!(duplicate_refresh.is_empty());
+
+        thread.set_comment(first_refresh[0], Ok(available(1, Vec::new())));
+        let (_, next_refresh) = thread.handle_key(Key::Refresh, 10);
+        assert_eq!(next_refresh.len(), 1);
     }
 
     #[test]

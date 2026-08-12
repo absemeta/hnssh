@@ -170,6 +170,15 @@ fn render_detail(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
     );
 }
 
+fn thread_indent(depth: usize) -> String {
+    const MAX_VISIBLE_INDENT: usize = 12;
+    if depth <= MAX_VISIBLE_INDENT {
+        "  ".repeat(depth)
+    } else {
+        format!("{}…{depth} ", "  ".repeat(MAX_VISIBLE_INDENT))
+    }
+}
+
 fn render_thread(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(size);
     let Some(thread) = browser.current_thread() else {
@@ -199,7 +208,7 @@ fn render_thread(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
                 let Some(comment) = thread.node(*node) else {
                     continue;
                 };
-                let indent = "  ".repeat((*depth).min(32));
+                let indent = thread_indent(*depth);
                 match comment.state() {
                     ThreadNodeState::Loading => lines.push(Line::from(Span::styled(
                         format!("{marker} {indent}[loading comment {}]", comment.id()),
@@ -233,8 +242,15 @@ fn render_thread(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
                                 } else {
                                     String::new()
                                 };
+                                let refreshing = if comment.refreshing() {
+                                    " · refreshing…"
+                                } else {
+                                    ""
+                                };
                                 lines.push(Line::from(Span::styled(
-                                    format!("{marker} {indent}{branch} {author}{age}{stale}"),
+                                    format!(
+                                        "{marker} {indent}{branch} {author}{age}{stale}{refreshing}"
+                                    ),
                                     style,
                                 )));
                                 if let Some(text) = &details.text {
@@ -280,7 +296,7 @@ fn render_thread(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
             ThreadRow::LoadMore {
                 depth, remaining, ..
             } => {
-                let indent = "  ".repeat((*depth).min(32));
+                let indent = thread_indent(*depth);
                 let count = (*remaining).min(20);
                 lines.push(Line::from(Span::styled(
                     format!("{marker} {indent}Load {count} more comments"),
@@ -288,7 +304,7 @@ fn render_thread(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
                 )));
             }
             ThreadRow::Marker { depth, label } => {
-                let indent = "  ".repeat((*depth).min(32));
+                let indent = thread_indent(*depth);
                 lines.push(Line::from(format!("{marker} {indent}{label}")));
             }
         }
