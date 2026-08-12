@@ -5,6 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 pub type FeedEntryId = u64;
+pub type CommentId = FeedEntryId;
 
 pub(crate) type ContentFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -34,6 +35,20 @@ pub trait ContentSource: Send + Sync {
         id: FeedEntryId,
     ) -> ContentFuture<'_, Result<ContentSnapshot<FeedEntry>, ContentError>> {
         self.feed_entry(id)
+    }
+
+    fn comment(
+        &self,
+        _id: CommentId,
+    ) -> ContentFuture<'_, Result<ContentSnapshot<Comment>, ContentError>> {
+        Box::pin(async { Err(ContentError::Unavailable) })
+    }
+
+    fn refresh_comment(
+        &self,
+        id: CommentId,
+    ) -> ContentFuture<'_, Result<ContentSnapshot<Comment>, ContentError>> {
+        self.comment(id)
     }
 }
 
@@ -208,9 +223,65 @@ pub struct EntryDetails {
     pub author: Option<String>,
     pub published_at: Option<SystemTime>,
     pub comment_count: Option<u32>,
+    pub comment_ids: Vec<CommentId>,
     pub text: Option<RichText>,
     pub links: Vec<Link>,
     pub omitted_link_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommentDetails {
+    pub id: CommentId,
+    pub parent: Option<FeedEntryId>,
+    pub author: Option<String>,
+    pub published_at: Option<SystemTime>,
+    pub text: Option<RichText>,
+    pub child_ids: Vec<CommentId>,
+    pub links: Vec<Link>,
+    pub omitted_link_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Comment {
+    Available(CommentDetails),
+    Deleted {
+        id: CommentId,
+        child_ids: Vec<CommentId>,
+    },
+    Dead {
+        id: CommentId,
+        child_ids: Vec<CommentId>,
+    },
+    Missing {
+        id: CommentId,
+    },
+    Unsupported {
+        id: CommentId,
+        item_type: String,
+        child_ids: Vec<CommentId>,
+    },
+}
+
+impl Comment {
+    pub fn id(&self) -> CommentId {
+        match self {
+            Self::Available(details) => details.id,
+            Self::Deleted { id, .. }
+            | Self::Dead { id, .. }
+            | Self::Missing { id }
+            | Self::Unsupported { id, .. } => *id,
+        }
+    }
+
+    pub fn child_ids(&self) -> &[CommentId] {
+        match self {
+            Self::Available(details) => &details.child_ids,
+            Self::Deleted { child_ids, .. }
+            | Self::Dead { child_ids, .. }
+            | Self::Unsupported { child_ids, .. } => child_ids,
+            Self::Missing { .. } => &[],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -363,6 +434,7 @@ impl FixtureContent {
                 author: None,
                 published_at: ago(now, Duration::from_secs(3 * 60 * 60)),
                 comment_count: None,
+                comment_ids: Vec::new(),
                 text: Some(RichText::plain("Build calm tools for noisy systems.")),
                 links: vec![Link::new(
                     "Acme careers",
@@ -379,6 +451,7 @@ impl FixtureContent {
                     author: Some("grace".to_owned()),
                     published_at: ago(now, Duration::from_secs(4 * 60 * 60)),
                     comment_count: Some(39),
+                    comment_ids: Vec::new(),
                     text: None,
                     links: Vec::new(),
                     omitted_link_count: 0,
@@ -562,6 +635,7 @@ fn story(
         author: Some(metadata.author.to_owned()),
         published_at: metadata.published_at,
         comment_count: Some(metadata.comment_count),
+        comment_ids: Vec::new(),
         text: text.map(RichText::plain),
         links,
         omitted_link_count: 0,

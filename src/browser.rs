@@ -1,9 +1,10 @@
 use std::time::Duration;
 
 use crate::content::{
-    ContentError, ContentFreshness, ContentSnapshot, FeedEntry, FeedEntryId, Link,
+    Comment, ContentError, ContentFreshness, ContentSnapshot, FeedEntry, FeedEntryId, Link,
 };
 use crate::input::Key;
+use crate::thread::{CommentLoad, CommentThread};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FeedStatus {
@@ -55,8 +56,15 @@ impl FeedRow {
 pub(crate) enum ViewKind {
     Feed,
     Detail,
+    Thread,
     Links,
     Help,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DetailAction {
+    Comments,
+    Links,
 }
 
 #[derive(Clone, Debug)]
@@ -68,6 +76,11 @@ enum ViewState {
     Detail {
         row: usize,
         scroll: u16,
+        selected_action: usize,
+    },
+    Thread {
+        row: usize,
+        thread: CommentThread,
     },
     Links {
         row: usize,
@@ -90,6 +103,7 @@ pub(crate) enum CommandOutcome {
     Redraw,
     RefreshTopFeed,
     LoadNextPage,
+    LoadComments,
     Unchanged,
     Quit,
 }
@@ -104,6 +118,8 @@ pub(crate) struct Browser {
     all_ids: Vec<FeedEntryId>,
     rows: Vec<FeedRow>,
     views: Vec<ViewState>,
+    pending_comment_loads: Vec<CommentLoad>,
+    next_thread_generation: u64,
 }
 
 impl Browser {
@@ -120,6 +136,8 @@ impl Browser {
                 selected: 0,
                 offset: 0,
             }],
+            pending_comment_loads: Vec::new(),
+            next_thread_generation: 1,
         }
     }
 
@@ -347,6 +365,7 @@ impl Browser {
         match self.views.last().expect("browser always has a root view") {
             ViewState::Feed { .. } => ViewKind::Feed,
             ViewState::Detail { .. } => ViewKind::Detail,
+            ViewState::Thread { .. } => ViewKind::Thread,
             ViewState::Links { .. } => ViewKind::Links,
             ViewState::Help { .. } => ViewKind::Help,
         }
@@ -361,7 +380,9 @@ impl Browser {
 
     pub(crate) fn current_entry(&self) -> Option<&FeedEntry> {
         let row = match self.views.last()? {
-            ViewState::Detail { row, .. } | ViewState::Links { row, .. } => *row,
+            ViewState::Detail { row, .. }
+            | ViewState::Thread { row, .. }
+            | ViewState::Links { row, .. } => *row,
             ViewState::Feed { selected, .. } => *selected,
             ViewState::Help { .. } => return None,
         };
@@ -371,7 +392,7 @@ impl Browser {
     pub(crate) fn current_scroll(&self) -> u16 {
         match self.views.last().expect("browser always has a root view") {
             ViewState::Detail { scroll, .. } | ViewState::Help { scroll } => *scroll,
-            ViewState::Feed { .. } | ViewState::Links { .. } => 0,
+            ViewState::Feed { .. } | ViewState::Thread { .. } | ViewState::Links { .. } => 0,
         }
     }
 
@@ -386,6 +407,58 @@ impl Browser {
 
     pub(crate) fn current_links(&self) -> &[Link] {
         self.current_entry().map_or(&[], FeedEntry::links)
+    }
+
+    pub(crate) fn detail_actions(&self) -> Vec<DetailAction> {
+        let Some(entry) = self.current_entry() else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        if entry
+            .details()
+            .is_some_and(|details| !details.comment_ids.is_empty())
+        {
+            actions.push(DetailAction::Comments);
+        }
+        if !entry.links().is_empty() {
+            actions.push(DetailAction::Links);
+        }
+        actions
+    }
+
+    pub(crate) fn detail_action_position(&self) -> usize {
+        match self.views.last() {
+            Some(ViewState::Detail {
+                selected_action, ..
+            }) => *selected_action,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn current_thread(&self) -> Option<&CommentThread> {
+        match self.views.last()? {
+            ViewState::Thread { thread, .. } => Some(thread),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn take_comment_loads(&mut self) -> Vec<CommentLoad> {
+        std::mem::take(&mut self.pending_comment_loads)
+    }
+
+    pub(crate) fn set_comment(
+        &mut self,
+        load: CommentLoad,
+        result: Result<ContentSnapshot<Comment>, ContentError>,
+    ) {
+        if let Some(thread) = self.views.iter_mut().rev().find_map(|view| match view {
+            ViewState::Thread { thread, .. } if thread.generation() == load.generation => {
+                Some(thread)
+            }
+            _ => None,
+        }) {
+            thread.set_comment(load, result);
+        }
     }
 
     pub(crate) fn handle_key(
@@ -422,6 +495,7 @@ impl Browser {
         match self.view_kind() {
             ViewKind::Feed => self.handle_feed_key(key, page_len.max(1)),
             ViewKind::Detail => self.handle_detail_key(key, page_len.max(1), detail_scroll_max),
+            ViewKind::Thread => self.handle_thread_key(key, page_len.max(1)),
             ViewKind::Links => self.handle_links_key(key, page_len.max(1)),
             ViewKind::Help => self.handle_help_key(key, page_len.max(1)),
         }
@@ -437,6 +511,7 @@ impl Browser {
                 self.views.push(ViewState::Detail {
                     row: selected,
                     scroll: 0,
+                    selected_action: 0,
                 });
                 return CommandOutcome::Redraw;
             }
@@ -477,30 +552,89 @@ impl Browser {
         detail_scroll_max: u16,
     ) -> CommandOutcome {
         if key == Key::Enter {
-            let Some(ViewState::Detail { row, .. }) = self.views.last() else {
+            let actions = self.detail_actions();
+            let Some(ViewState::Detail {
+                row,
+                selected_action,
+                ..
+            }) = self.views.last()
+            else {
                 unreachable!()
             };
             let row = *row;
-            if self
-                .rows
-                .get(row)
-                .and_then(FeedRow::entry)
-                .is_some_and(|entry| !entry.links().is_empty())
-            {
-                self.views.push(ViewState::Links {
-                    row,
-                    selected: 0,
-                    offset: 0,
-                });
-                return CommandOutcome::Redraw;
-            }
-            return CommandOutcome::Unchanged;
+            return match actions.get(*selected_action) {
+                Some(DetailAction::Comments) => {
+                    let Some(details) = self
+                        .rows
+                        .get(row)
+                        .and_then(FeedRow::entry)
+                        .and_then(FeedEntry::details)
+                    else {
+                        return CommandOutcome::Unchanged;
+                    };
+                    let entry_id = details.id;
+                    let root_ids = details.comment_ids.clone();
+                    let generation = self.next_thread_generation;
+                    self.next_thread_generation = self.next_thread_generation.wrapping_add(1);
+                    let (thread, loads) = CommentThread::open(entry_id, root_ids, generation);
+                    self.views.push(ViewState::Thread { row, thread });
+                    self.pending_comment_loads.extend(loads);
+                    CommandOutcome::LoadComments
+                }
+                Some(DetailAction::Links) => {
+                    self.views.push(ViewState::Links {
+                        row,
+                        selected: 0,
+                        offset: 0,
+                    });
+                    CommandOutcome::Redraw
+                }
+                None => CommandOutcome::Unchanged,
+            };
         }
 
-        let ViewState::Detail { scroll, .. } = self.views.last_mut().expect("detail exists") else {
+        let action_count = self.detail_actions().len();
+        let ViewState::Detail {
+            scroll,
+            selected_action,
+            ..
+        } = self.views.last_mut().expect("detail exists")
+        else {
             unreachable!()
         };
-        update_scroll(scroll, key, page_len, detail_scroll_max)
+        let previous_action = *selected_action;
+        match key {
+            Key::Up if action_count > 1 => *selected_action = selected_action.saturating_sub(1),
+            Key::Down if action_count > 1 => {
+                *selected_action = selected_action
+                    .saturating_add(1)
+                    .min(action_count.saturating_sub(1));
+            }
+            Key::PageUp | Key::PageDown | Key::First | Key::Last => {
+                return update_scroll(scroll, key, page_len, detail_scroll_max);
+            }
+            _ => return CommandOutcome::Unchanged,
+        }
+        if previous_action == *selected_action {
+            CommandOutcome::Unchanged
+        } else {
+            CommandOutcome::Redraw
+        }
+    }
+
+    fn handle_thread_key(&mut self, key: Key, page_len: usize) -> CommandOutcome {
+        let Some(ViewState::Thread { thread, .. }) = self.views.last_mut() else {
+            unreachable!()
+        };
+        let (changed, loads) = thread.handle_key(key, page_len);
+        if !loads.is_empty() {
+            self.pending_comment_loads.extend(loads);
+            CommandOutcome::LoadComments
+        } else if changed {
+            CommandOutcome::Redraw
+        } else {
+            CommandOutcome::Unchanged
+        }
     }
 
     fn handle_links_key(&mut self, key: Key, page_len: usize) -> CommandOutcome {
@@ -535,7 +669,7 @@ impl Browser {
         let ViewState::Help { scroll } = self.views.last_mut().expect("help exists") else {
             unreachable!()
         };
-        update_scroll(scroll, key, page_len, 8)
+        update_scroll(scroll, key, page_len, 10)
     }
 
     fn clamp_feed_selection(&mut self, page_len: usize) {

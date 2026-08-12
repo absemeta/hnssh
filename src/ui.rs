@@ -6,8 +6,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::browser::{Browser, FeedRowState, FeedStatus, ViewKind};
-use crate::content::{ContentFreshness, EntryDetails, FeedEntry, PollOptionStatus, RichText};
+use crate::browser::{Browser, DetailAction, FeedRowState, FeedStatus, ViewKind};
+use crate::content::{
+    Comment, ContentFreshness, EntryDetails, FeedEntry, PollOptionStatus, RichText,
+};
+use crate::thread::{ThreadNodeState, ThreadRow};
 
 pub(crate) const MIN_COLUMNS: u16 = 60;
 pub(crate) const MIN_ROWS: u16 = 16;
@@ -22,7 +25,7 @@ pub(crate) fn detail_scroll_max(browser: &Browser, size: Rect) -> u16 {
     };
     let width = usize::from(size.width.saturating_sub(2).max(1));
     let visible_rows = usize::from(size.height.saturating_sub(3).max(1));
-    let content_rows = detail_lines(entry)
+    let content_rows = detail_lines(browser, entry)
         .iter()
         .map(|line| line.width().max(1).div_ceil(width))
         .sum::<usize>();
@@ -39,6 +42,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
     match browser.view_kind() {
         ViewKind::Feed => render_feed(frame, browser, size),
         ViewKind::Detail => render_detail(frame, browser, size),
+        ViewKind::Thread => render_thread(frame, browser, size),
         ViewKind::Links => render_links(frame, browser, size),
         ViewKind::Help => render_help(frame, browser, size),
     }
@@ -148,7 +152,7 @@ fn render_detail(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
         return;
     };
 
-    let panel = Paragraph::new(detail_lines(entry))
+    let panel = Paragraph::new(detail_lines(browser, entry))
         .scroll((browser.current_scroll(), 0))
         .wrap(Wrap { trim: false })
         .block(
@@ -158,7 +162,146 @@ fn render_detail(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
         );
     frame.render_widget(panel, body);
     frame.render_widget(
-        Paragraph::new("↑/↓ scroll · Enter links · Escape/Backspace back · ? help · q quit")
+        Paragraph::new(
+            "↑/↓ choose action · PgUp/PgDn scroll · Enter open · Escape back · ? help · q quit",
+        )
+        .alignment(Alignment::Center),
+        footer,
+    );
+}
+
+fn render_thread(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(size);
+    let Some(thread) = browser.current_thread() else {
+        frame.render_widget(Paragraph::new("Comment thread unavailable"), body);
+        return;
+    };
+    let rows = thread.rows();
+    let (selected, offset) = thread.position();
+    let mut lines = Vec::new();
+    for (position, row) in rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(page_len(size.height))
+    {
+        let selected = position == selected;
+        let marker = if selected { ">" } else { " " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        match row {
+            ThreadRow::Comment { node, depth } => {
+                let Some(comment) = thread.node(*node) else {
+                    continue;
+                };
+                let indent = "  ".repeat((*depth).min(32));
+                match comment.state() {
+                    ThreadNodeState::Loading => lines.push(Line::from(Span::styled(
+                        format!("{marker} {indent}[loading comment {}]", comment.id()),
+                        style,
+                    ))),
+                    ThreadNodeState::Unavailable => lines.push(Line::from(Span::styled(
+                        format!("{marker} {indent}[comment unavailable]"),
+                        style,
+                    ))),
+                    ThreadNodeState::Retryable => lines.push(Line::from(Span::styled(
+                        format!("{marker} {indent}[comment temporarily unavailable]"),
+                        style,
+                    ))),
+                    ThreadNodeState::Ready(snapshot) => {
+                        let branch = if comment.has_children() {
+                            if comment.expanded() { "▼" } else { "▶" }
+                        } else {
+                            "•"
+                        };
+                        match &snapshot.value {
+                            Comment::Available(details) => {
+                                let author =
+                                    details.author.as_deref().unwrap_or("[author unavailable]");
+                                let age = details
+                                    .published_at
+                                    .map(relative_age)
+                                    .map(|age| format!(" · {age}"))
+                                    .unwrap_or_default();
+                                let stale = if snapshot.freshness.is_stale() {
+                                    format!(" · stale · {} old", cache_age(snapshot.current_age()))
+                                } else {
+                                    String::new()
+                                };
+                                lines.push(Line::from(Span::styled(
+                                    format!("{marker} {indent}{branch} {author}{age}{stale}"),
+                                    style,
+                                )));
+                                if let Some(text) = &details.text {
+                                    let text_indent = format!("  {indent}  ");
+                                    for mut line in render_rich_text(text) {
+                                        line.spans.insert(0, Span::from(text_indent.clone()));
+                                        lines.push(line);
+                                    }
+                                } else {
+                                    lines.push(Line::from(format!(
+                                        "  {indent}  [comment text unavailable]"
+                                    )));
+                                }
+                                if details.omitted_link_count > 0 {
+                                    lines.push(Line::from(format!(
+                                        "  {indent}  Unsafe or malformed links omitted: {}",
+                                        details.omitted_link_count
+                                    )));
+                                }
+                            }
+                            Comment::Deleted { .. } => lines.push(Line::from(Span::styled(
+                                format!("{marker} {indent}{branch} [deleted comment]"),
+                                style,
+                            ))),
+                            Comment::Dead { .. } => lines.push(Line::from(Span::styled(
+                                format!("{marker} {indent}{branch} [dead comment]"),
+                                style,
+                            ))),
+                            Comment::Missing { .. } => lines.push(Line::from(Span::styled(
+                                format!("{marker} {indent}• [comment missing]"),
+                                style,
+                            ))),
+                            Comment::Unsupported { item_type, .. } => {
+                                lines.push(Line::from(Span::styled(
+                                    format!("{marker} {indent}{branch} [unsupported {item_type}]"),
+                                    style,
+                                )))
+                            }
+                        }
+                    }
+                }
+            }
+            ThreadRow::LoadMore {
+                depth, remaining, ..
+            } => {
+                let indent = "  ".repeat((*depth).min(32));
+                let count = (*remaining).min(20);
+                lines.push(Line::from(Span::styled(
+                    format!("{marker} {indent}Load {count} more comments"),
+                    style,
+                )));
+            }
+            ThreadRow::Marker { depth, label } => {
+                let indent = "  ".repeat((*depth).min(32));
+                lines.push(Line::from(format!("{marker} {indent}{label}")));
+            }
+        }
+    }
+
+    let panel = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .title(" HNSSH · Comment thread ")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(panel, body);
+    frame.render_widget(
+        Paragraph::new("j/k move · ← collapse/parent · → expand · Space toggle · Enter load/retry · ? help · q quit")
             .alignment(Alignment::Center),
         footer,
     );
@@ -215,10 +358,12 @@ fn render_help(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
         Line::from("Down / j               Move down"),
         Line::from("Page Up / Page Down    Move by one page"),
         Line::from("g / G                  First / last loaded row"),
-        Line::from("Enter                  Open the selected entry or its links"),
+        Line::from("Enter                  Open the selected entry or action; load/retry comments"),
+        Line::from("Left / Right           Collapse or move to parent / expand a comment"),
+        Line::from("Space                  Toggle the selected comment subtree"),
         Line::from("Escape / Backspace     Return to the previous view"),
         Line::from("?                      Open this help"),
-        Line::from("r                      Refresh or retry the top feed"),
+        Line::from("r                      Refresh or retry the current feed or comment"),
         Line::from("q                      Quit HNSSH"),
     ];
     let panel = Paragraph::new(lines)
@@ -255,7 +400,7 @@ fn feed_metadata(state: &FeedRowState) -> String {
     }
 }
 
-fn detail_lines(entry: &FeedEntry) -> Vec<Line<'static>> {
+fn detail_lines(browser: &Browser, entry: &FeedEntry) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(
             entry.title().to_owned(),
@@ -299,15 +444,29 @@ fn detail_lines(entry: &FeedEntry) -> Vec<Line<'static>> {
         }
     }
     lines.push(Line::from(""));
-    if entry.links().is_empty() {
-        lines.push(Line::from("No links available"));
+    let actions = browser.detail_actions();
+    if actions.is_empty() {
+        lines.push(Line::from("No comments or links available"));
     } else {
-        lines.push(Line::from(Span::styled(
-            "Enter  View links",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
+        let selected = browser.detail_action_position();
+        for (position, action) in actions.iter().enumerate() {
+            let marker = if position == selected { ">" } else { " " };
+            let label = match action {
+                DetailAction::Comments => "View comments",
+                DetailAction::Links => "View links",
+            };
+            let style = if position == selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{marker} Enter  {label}"),
+                style,
+            )));
+        }
     }
     lines
 }

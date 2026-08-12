@@ -20,9 +20,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::browser::{Browser, CommandOutcome, ContentUpdate, FeedEntryLoad};
-use crate::content::{ContentError, ContentSnapshot, ContentSource, FeedEntry, FeedEntryId};
+use crate::content::{
+    Comment, ContentError, ContentSnapshot, ContentSource, FeedEntry, FeedEntryId,
+};
 use crate::hacker_news::HackerNewsContent;
 use crate::input::{InputDecoder, Key};
+use crate::thread::{CommentLoad, CommentUpdate};
 use crate::ui;
 
 const DEFAULT_SESSION_SIZE: TerminalSize = TerminalSize {
@@ -270,6 +273,10 @@ enum ActorEvent {
         result: Result<ContentSnapshot<FeedEntry>, ContentError>,
         update: ContentUpdate,
     },
+    Comment {
+        load: CommentLoad,
+        result: Result<ContentSnapshot<Comment>, ContentError>,
+    },
     Input(Key),
     Resize(TerminalSize),
     Stop,
@@ -367,6 +374,26 @@ impl SessionActor {
                         );
                     }
                 }
+                ActorEvent::Comment { load, result } => {
+                    let revalidate = needs_background_revalidation(
+                        &result,
+                        match load.update {
+                            CommentUpdate::Initial => ContentUpdate::Initial,
+                            CommentUpdate::Revalidation => ContentUpdate::Revalidation,
+                        },
+                    );
+                    self.browser.set_comment(load, result);
+                    self.render().await?;
+                    if revalidate {
+                        self.load_comment(
+                            CommentLoad {
+                                update: CommentUpdate::Revalidation,
+                                ..load
+                            },
+                            event_sender.clone(),
+                        );
+                    }
+                }
                 ActorEvent::Input(key) => {
                     let detail_scroll_max = ui::detail_scroll_max(&self.browser, self.size.area());
                     match self
@@ -382,6 +409,11 @@ impl SessionActor {
                             let entries = self.browser.load_next_page(TOP_FEED_PAGE_SIZE);
                             self.render().await?;
                             self.load_entries(entries, &event_sender, ContentUpdate::Initial);
+                        }
+                        CommandOutcome::LoadComments => {
+                            let loads = self.browser.take_comment_loads();
+                            self.render().await?;
+                            self.load_comments(loads, &event_sender);
                         }
                         CommandOutcome::Unchanged => {}
                         CommandOutcome::Quit => {
@@ -457,6 +489,35 @@ impl SessionActor {
                 result,
                 update,
             });
+        });
+    }
+
+    fn load_comments(&self, loads: Vec<CommentLoad>, events: &UnboundedSender<ActorEvent>) {
+        for load in loads {
+            self.load_comment(load, events.clone());
+        }
+    }
+
+    fn load_comment(&self, load: CommentLoad, events: UnboundedSender<ActorEvent>) {
+        let source = Arc::clone(&self.source);
+        let item_limit = Arc::clone(&self.item_limit);
+        tokio::spawn(async move {
+            let permit = match item_limit.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let _ = events.send(ActorEvent::Comment {
+                        load,
+                        result: Err(ContentError::Retryable),
+                    });
+                    return;
+                }
+            };
+            let result = match load.update {
+                CommentUpdate::Initial => source.comment(load.id).await,
+                CommentUpdate::Revalidation => source.refresh_comment(load.id).await,
+            };
+            drop(permit);
+            let _ = events.send(ActorEvent::Comment { load, result });
         });
     }
 

@@ -356,7 +356,7 @@ async fn read_until_visible(
     raw_output: &mut Vec<u8>,
     expected: &str,
 ) -> TestResult {
-    timeout(TEST_TIMEOUT, async {
+    let waited = timeout(TEST_TIMEOUT, async {
         loop {
             let message = channel
                 .wait()
@@ -371,8 +371,15 @@ async fn read_until_visible(
             }
         }
     })
-    .await??;
-    Ok(())
+    .await;
+    match waited {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "timed out waiting for {expected:?}; current screen:\n{}",
+            terminal.screen().contents()
+        )
+        .into()),
+    }
 }
 
 fn row_metadata_contains(screen: &str, row: &str, metadata: &str) -> bool {
@@ -1612,14 +1619,14 @@ async fn cache_uses_five_minute_freshness_class_for_comments_and_poll_options() 
     let content = HackerNewsContent::for_endpoint_with_options(fake.endpoint(), options);
 
     content.feed_entry(10).await?;
-    content.feed_entry(11).await?;
+    content.comment(11).await?;
     content.feed_entry(12).await?;
     sleep(Duration::from_millis(30)).await;
     assert!(content.feed_entry(10).await?.freshness.is_stale());
-    assert!(content.feed_entry(11).await?.freshness.is_fresh());
+    assert!(content.comment(11).await?.freshness.is_fresh());
     assert!(content.feed_entry(12).await?.freshness.is_fresh());
     sleep(Duration::from_millis(80)).await;
-    assert!(content.feed_entry(11).await?.freshness.is_stale());
+    assert!(content.comment(11).await?.freshness.is_stale());
     assert!(content.feed_entry(12).await?.freshness.is_stale());
     assert_eq!(fake.request_count("item/10"), 1);
     assert_eq!(fake.request_count("item/11"), 1);
@@ -1773,6 +1780,242 @@ async fn cache_weight_cap_evicts_large_inactive_records() -> TestResult {
         "the content-weight cap evicts an inactive large record"
     );
 
+    fake.stop().await
+}
+
+#[tokio::test]
+async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> TestResult {
+    let mut routes = HashMap::new();
+    routes.insert("topstories".to_owned(), vec![FakeReply::json("[1]")]);
+    routes.insert(
+        "item/1".to_owned(),
+        vec![FakeReply::json(format!(
+            r#"{{"id":1,"type":"story","title":"Threaded story","url":"https://example.com/threaded","descendants":24,"kids":[{}]}}"#,
+            (10..=31)
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))],
+    );
+    routes.insert(
+        "item/10".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":10,"type":"comment","parent":1,"by":"root-author","time":1700000000,"text":"Root &amp; safe","kids":[100,101,10,100]}"#,
+        )],
+    );
+    routes.insert(
+        "item/11".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":11,"type":"comment","parent":1,"deleted":true}"#,
+        )],
+    );
+    routes.insert(
+        "item/12".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":12,"type":"comment","parent":1,"dead":true}"#,
+        )],
+    );
+    routes.insert("item/13".to_owned(), vec![FakeReply::json("null")]);
+    routes.insert(
+        "item/14".to_owned(),
+        vec![
+            FakeReply::status(StatusCode::SERVICE_UNAVAILABLE),
+            FakeReply::status(StatusCode::SERVICE_UNAVAILABLE),
+            FakeReply::json(
+                r#"{"id":14,"type":"comment","parent":1,"by":"recovered","text":"Recovered comment"}"#,
+            ),
+        ],
+    );
+    routes.insert(
+        "item/15".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":15,"type":"story","title":"Wrong child type"}"#,
+        )],
+    );
+    for id in 16..=31 {
+        routes.insert(
+            format!("item/{id}"),
+            vec![FakeReply::json(format!(
+                r#"{{"id":{id},"type":"comment","parent":1,"by":"author-{id}","text":"Comment {id}"}}"#
+            ))],
+        );
+    }
+    routes.insert(
+        "item/100".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":100,"type":"comment","parent":10,"by":"nested-a","text":"Nested first"}"#,
+        )],
+    );
+    routes.insert(
+        "item/101".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":101,"type":"comment","parent":10,"by":"nested-b","text":"Nested second"}"#,
+        )],
+    );
+
+    let fake = FakeHackerNews::start(routes).await?;
+    let content = Arc::new(HackerNewsContent::for_endpoint_with_options(
+        fake.endpoint(),
+        fast_hacker_news_options(),
+    ));
+    let server = TestServer::start_with_content(content).await?;
+    let (connection, mut channel, mut terminal, mut raw_output) = open_terminal(&server).await?;
+
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Threaded story",
+    )
+    .await?;
+    channel.data_bytes(&b"\r"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "View comments",
+    )
+    .await?;
+    channel.data_bytes(&b"\r"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Comment thread",
+    )
+    .await?;
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Root & safe").await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "[comment temporarily unavailable]",
+    )
+    .await?;
+    let first_page = terminal.screen().contents();
+    assert!(first_page.contains("[deleted comment]"));
+    assert!(first_page.contains("[dead comment]"));
+    assert!(first_page.contains("[comment missing]"));
+    assert!(first_page.contains("[unsupported story]"));
+    assert_eq!(fake.request_count("item/29"), 1);
+    assert_eq!(fake.request_count("item/30"), 0);
+    assert!(fake.maximum_active_items() <= 8);
+
+    sleep(Duration::from_millis(90)).await;
+    channel.data_bytes(&b"gjjjj\r"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Recovered comment",
+    )
+    .await?;
+    assert_eq!(fake.request_count("item/14"), 3);
+
+    channel.data_bytes(&b"g\x1b[C"[..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Nested first").await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Nested second",
+    )
+    .await?;
+    let expanded = terminal.screen().contents();
+    assert!(expanded.contains("[cycle to comment 10 omitted]"));
+    assert!(expanded.contains("[duplicate comment 100 omitted]"));
+    assert_eq!(fake.request_count("item/100"), 1);
+    assert_eq!(fake.request_count("item/101"), 1);
+
+    channel.data_bytes(&b"j"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        ">   • nested-a",
+    )
+    .await?;
+    channel.data_bytes(&b"\x1b[D"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "> ▼ root-author",
+    )
+    .await?;
+    channel.data_bytes(&b"\x1b[D"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "> ▶ root-author",
+    )
+    .await?;
+    assert!(!terminal.screen().contents().contains("Nested first"));
+    channel.data_bytes(&b"\x1b[C"[..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Nested first").await?;
+    assert_eq!(fake.request_count("item/100"), 1);
+
+    channel.data_bytes(&b"G"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "> Load 2 more comments",
+    )
+    .await?;
+    channel.data_bytes(&b"\r"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "> • author-30",
+    )
+    .await?;
+    assert_eq!(fake.request_count("item/30"), 1);
+    assert_eq!(fake.request_count("item/31"), 1);
+
+    channel.data_bytes(&b"?"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Keyboard help",
+    )
+    .await?;
+    channel.data_bytes(&[0x1b][..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "> • author-30",
+    )
+    .await?;
+
+    channel.data_bytes(&[0x1b][..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Entry details",
+    )
+    .await?;
+    channel.data_bytes(&b"j\r"[..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Entry links").await?;
+    assert!(
+        terminal
+            .screen()
+            .contents()
+            .contains("https://example.com/threaded")
+    );
+
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut raw_output).await?, 0);
+    connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await?;
     fake.stop().await
 }
 

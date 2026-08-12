@@ -11,8 +11,9 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep};
 
 use crate::content::{
-    ContentError, ContentFreshness, ContentFuture, ContentSnapshot, ContentSource, EntryDetails,
-    FeedEntry, FeedEntryId, Link, PollOption, PollOptionStatus, RichText,
+    Comment, CommentDetails, CommentId, ContentError, ContentFreshness, ContentFuture,
+    ContentSnapshot, ContentSource, EntryDetails, FeedEntry, FeedEntryId, Link, PollOption,
+    PollOptionStatus, RichText,
 };
 use crate::content_safety::{normalize_html, normalize_inline_text, validated_url};
 
@@ -156,7 +157,7 @@ impl HackerNewsContent {
                     item.cache_fresh_for(&options)
                 });
                 let item = item.map_or_else(
-                    || Ok(CachedItem::unavailable(id)),
+                    || Ok(CachedItem::missing(id)),
                     |item| item.into_cached_item(id),
                 )?;
                 Ok(ResourceValue::Item {
@@ -191,6 +192,21 @@ impl HackerNewsContent {
                 PollOption::placeholder(PollOptionStatus::Unavailable)
             }
         }
+    }
+
+    fn comment_request(
+        &self,
+        id: CommentId,
+        request: CacheRequest,
+    ) -> ContentFuture<'_, Result<ContentSnapshot<Comment>, ContentError>> {
+        Box::pin(async move {
+            self.item_request(id, request)
+                .await?
+                .try_map(|resource| match resource {
+                    ResourceValue::Item { item, .. } => Ok(item.comment),
+                    ResourceValue::TopFeed(_) => Err(ContentError::Unavailable),
+                })
+        })
     }
 
     fn feed_entry_request(
@@ -275,6 +291,20 @@ impl ContentSource for HackerNewsContent {
     ) -> ContentFuture<'_, Result<ContentSnapshot<FeedEntry>, ContentError>> {
         self.feed_entry_request(id, CacheRequest::Revalidate)
     }
+
+    fn comment(
+        &self,
+        id: CommentId,
+    ) -> ContentFuture<'_, Result<ContentSnapshot<Comment>, ContentError>> {
+        self.comment_request(id, CacheRequest::Read)
+    }
+
+    fn refresh_comment(
+        &self,
+        id: CommentId,
+    ) -> ContentFuture<'_, Result<ContentSnapshot<Comment>, ContentError>> {
+        self.comment_request(id, CacheRequest::Revalidate)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,20 +326,25 @@ struct UpstreamItem {
     text: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_ids")]
     parts: Option<Vec<FeedEntryId>>,
+    #[serde(default, deserialize_with = "deserialize_optional_ids")]
+    kids: Option<Vec<CommentId>>,
+    parent: Option<FeedEntryId>,
     descendants: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
 struct CachedItem {
     entry: FeedEntry,
+    comment: Comment,
     poll_option: Option<PollOption>,
     poll_option_ids: Vec<FeedEntryId>,
 }
 
 impl CachedItem {
-    fn unavailable(id: FeedEntryId) -> Self {
+    fn missing(id: FeedEntryId) -> Self {
         Self {
             entry: FeedEntry::Unavailable { id },
+            comment: Comment::Missing { id },
             poll_option: None,
             poll_option_ids: Vec::new(),
         }
@@ -329,13 +364,72 @@ impl UpstreamItem {
         if self.id.is_some_and(|id| id != requested_id) {
             return Err(ContentError::Unavailable);
         }
-        if self.dead == Some(true) || self.deleted == Some(true) {
-            return Ok(CachedItem::unavailable(requested_id));
+        let Some(item_type) = self.item_type.clone() else {
+            return Ok(CachedItem::missing(requested_id));
+        };
+        let child_ids = self.kids.clone().unwrap_or_default();
+
+        if item_type == "comment" {
+            let comment = if self.deleted == Some(true) {
+                Comment::Deleted {
+                    id: requested_id,
+                    child_ids,
+                }
+            } else if self.dead == Some(true) {
+                Comment::Dead {
+                    id: requested_id,
+                    child_ids,
+                }
+            } else {
+                let normalized = self.text.as_deref().map(normalize_html);
+                let text = normalized
+                    .as_ref()
+                    .map(|content| content.text.clone())
+                    .filter(|text| !text.lines.is_empty());
+                let links = normalized
+                    .as_ref()
+                    .map(|content| content.links.clone())
+                    .unwrap_or_default();
+                let omitted_link_count = normalized
+                    .as_ref()
+                    .map_or(0, |content| content.omitted_link_count);
+                Comment::Available(CommentDetails {
+                    id: requested_id,
+                    parent: self.parent,
+                    author: self.by.as_deref().and_then(normalize_inline_text),
+                    published_at: self.time.and_then(upstream_timestamp),
+                    text,
+                    child_ids,
+                    links,
+                    omitted_link_count,
+                })
+            };
+            return Ok(CachedItem {
+                entry: FeedEntry::Unsupported {
+                    id: requested_id,
+                    item_type,
+                    title: None,
+                },
+                comment,
+                poll_option: None,
+                poll_option_ids: Vec::new(),
+            });
         }
 
-        let Some(item_type) = self.item_type else {
-            return Ok(CachedItem::unavailable(requested_id));
+        let comment = Comment::Unsupported {
+            id: requested_id,
+            item_type: item_type.clone(),
+            child_ids: child_ids.clone(),
         };
+        if self.dead == Some(true) || self.deleted == Some(true) {
+            return Ok(CachedItem {
+                entry: FeedEntry::Unavailable { id: requested_id },
+                comment,
+                poll_option: None,
+                poll_option_ids: Vec::new(),
+            });
+        }
+
         let title = self.title.as_deref().and_then(normalize_inline_text);
         let author = self.by.as_deref().and_then(normalize_inline_text);
         let normalized_text = self.text.as_deref().map(normalize_html);
@@ -366,12 +460,14 @@ impl UpstreamItem {
             author,
             published_at: self.time.and_then(upstream_timestamp),
             comment_count: self.descendants,
+            comment_ids: child_ids,
             text,
             omitted_link_count,
         };
         if item_type == "job" {
             details.score = None;
             details.comment_count = None;
+            details.comment_ids.clear();
         }
         let poll_option = (item_type == "pollopt").then(|| {
             self.text
@@ -404,6 +500,7 @@ impl UpstreamItem {
         };
         Ok(CachedItem {
             entry,
+            comment,
             poll_option: poll_option.flatten(),
             poll_option_ids,
         })
@@ -568,10 +665,35 @@ impl ResourceValue {
 }
 
 fn cached_item_weight(item: &CachedItem) -> usize {
-    let mut weight =
-        feed_entry_weight(&item.entry).saturating_add(item.poll_option_ids.len().saturating_mul(8));
+    let mut weight = feed_entry_weight(&item.entry)
+        .saturating_add(comment_weight(&item.comment))
+        .saturating_add(item.poll_option_ids.len().saturating_mul(8));
     if let Some(option) = &item.poll_option {
         weight = weight.saturating_add(option.text.len()).saturating_add(16);
+    }
+    weight
+}
+
+fn comment_weight(comment: &Comment) -> usize {
+    let mut weight = 64usize.saturating_add(comment.child_ids().len().saturating_mul(8));
+    match comment {
+        Comment::Available(details) => {
+            if let Some(author) = &details.author {
+                weight = weight.saturating_add(author.len());
+            }
+            if let Some(text) = &details.text {
+                weight = weight.saturating_add(rich_text_weight(text));
+            }
+            for link in &details.links {
+                weight = weight
+                    .saturating_add(link.label.len())
+                    .saturating_add(link.destination.len());
+            }
+        }
+        Comment::Unsupported { item_type, .. } => {
+            weight = weight.saturating_add(item_type.len());
+        }
+        Comment::Deleted { .. } | Comment::Dead { .. } | Comment::Missing { .. } => {}
     }
     weight
 }
@@ -592,6 +714,7 @@ fn feed_entry_weight(entry: &FeedEntry) -> usize {
         if let Some(text) = &details.text {
             weight = weight.saturating_add(rich_text_weight(text));
         }
+        weight = weight.saturating_add(details.comment_ids.len().saturating_mul(8));
         for link in &details.links {
             weight = weight
                 .saturating_add(link.label.len())

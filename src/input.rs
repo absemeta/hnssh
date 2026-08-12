@@ -6,7 +6,10 @@ pub(crate) enum Key {
     PageDown,
     First,
     Last,
+    Left,
+    Right,
     Enter,
+    Toggle,
     Back,
     Help,
     Refresh,
@@ -62,6 +65,7 @@ fn decode_one(bytes: &[u8]) -> Decode {
         b'?' => Decode::Key(Key::Help, 1),
         b'r' => Decode::Key(Key::Refresh, 1),
         b'q' => Decode::Key(Key::Quit, 1),
+        b' ' => Decode::Key(Key::Toggle, 1),
         b'\r' | b'\n' => Decode::Key(Key::Enter, 1),
         0x08 | 0x7f => Decode::Key(Key::Back, 1),
         0x1b => decode_escape(bytes),
@@ -83,6 +87,8 @@ fn decode_escape(bytes: &[u8]) -> Decode {
                 match bytes[2] {
                     b'A' => Decode::Key(Key::Up, 3),
                     b'B' => Decode::Key(Key::Down, 3),
+                    b'C' => Decode::Key(Key::Right, 3),
+                    b'D' => Decode::Key(Key::Left, 3),
                     _ => Decode::Ignore(3),
                 }
             }
@@ -99,6 +105,8 @@ fn decode_csi(bytes: &[u8]) -> Decode {
     match bytes[2] {
         b'A' => Decode::Key(Key::Up, 3),
         b'B' => Decode::Key(Key::Down, 3),
+        b'C' => Decode::Key(Key::Right, 3),
+        b'D' => Decode::Key(Key::Left, 3),
         b'H' => Decode::Key(Key::First, 3),
         b'F' => Decode::Key(Key::Last, 3),
         b'5' | b'6' => {
@@ -135,8 +143,17 @@ mod tests {
         let mut decoder = InputDecoder::default();
 
         assert_eq!(
-            decoder.push(b"jk\x1b[A\x1b[6~?"),
-            vec![Key::Down, Key::Up, Key::Up, Key::PageDown, Key::Help]
+            decoder.push(b"jk\x1b[A\x1b[C\x1b[D \x1b[6~?"),
+            vec![
+                Key::Down,
+                Key::Up,
+                Key::Up,
+                Key::Right,
+                Key::Left,
+                Key::Toggle,
+                Key::PageDown,
+                Key::Help,
+            ]
         );
     }
 

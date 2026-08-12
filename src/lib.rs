@@ -4,12 +4,13 @@ mod content_safety;
 mod hacker_news;
 mod input;
 mod server;
+mod thread;
 mod ui;
 
 pub use content::{
-    ContentError, ContentFreshness, ContentSnapshot, ContentSource, EntryDetails, FeedEntry,
-    FeedEntryId, FixtureContent, Link, PollOption, PollOptionStatus, RichText, RichTextLine,
-    RichTextSpan, RichTextStyle,
+    Comment, CommentDetails, CommentId, ContentError, ContentFreshness, ContentSnapshot,
+    ContentSource, EntryDetails, FeedEntry, FeedEntryId, FixtureContent, Link, PollOption,
+    PollOptionStatus, RichText, RichTextLine, RichTextSpan, RichTextStyle,
 };
 pub use hacker_news::{HackerNewsContent, HackerNewsOptions};
 pub use server::{Server, ServerConfig, ServerError};
