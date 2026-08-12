@@ -388,7 +388,12 @@ impl Browser {
         self.current_entry().map_or(&[], FeedEntry::links)
     }
 
-    pub(crate) fn handle_key(&mut self, key: Key, page_len: usize) -> CommandOutcome {
+    pub(crate) fn handle_key(
+        &mut self,
+        key: Key,
+        page_len: usize,
+        detail_scroll_max: u16,
+    ) -> CommandOutcome {
         if key == Key::Quit {
             return CommandOutcome::Quit;
         }
@@ -416,7 +421,7 @@ impl Browser {
 
         match self.view_kind() {
             ViewKind::Feed => self.handle_feed_key(key, page_len.max(1)),
-            ViewKind::Detail => self.handle_detail_key(key, page_len.max(1)),
+            ViewKind::Detail => self.handle_detail_key(key, page_len.max(1), detail_scroll_max),
             ViewKind::Links => self.handle_links_key(key, page_len.max(1)),
             ViewKind::Help => self.handle_help_key(key, page_len.max(1)),
         }
@@ -465,7 +470,12 @@ impl Browser {
         }
     }
 
-    fn handle_detail_key(&mut self, key: Key, page_len: usize) -> CommandOutcome {
+    fn handle_detail_key(
+        &mut self,
+        key: Key,
+        page_len: usize,
+        detail_scroll_max: u16,
+    ) -> CommandOutcome {
         if key == Key::Enter {
             let Some(ViewState::Detail { row, .. }) = self.views.last() else {
                 unreachable!()
@@ -490,7 +500,7 @@ impl Browser {
         let ViewState::Detail { scroll, .. } = self.views.last_mut().expect("detail exists") else {
             unreachable!()
         };
-        update_scroll(scroll, key, page_len, 64)
+        update_scroll(scroll, key, page_len, detail_scroll_max)
     }
 
     fn handle_links_key(&mut self, key: Key, page_len: usize) -> CommandOutcome {
@@ -609,8 +619,8 @@ mod tests {
         let mut browser = Browser::new();
         browser.set_top_feed(Ok(ids.clone()), 30, ContentUpdate::Initial);
 
-        browser.handle_key(Key::Down, 2);
-        browser.handle_key(Key::Down, 2);
+        browser.handle_key(Key::Down, 2, 0);
+        browser.handle_key(Key::Down, 2, 0);
         assert_eq!(browser.feed_position(), (2, 1));
 
         for (index, id) in ids.value.into_iter().enumerate() {
@@ -623,9 +633,9 @@ mod tests {
         }
         assert_eq!(browser.feed_position(), (2, 1));
 
-        assert_eq!(browser.handle_key(Key::Enter, 2), CommandOutcome::Redraw);
+        assert_eq!(browser.handle_key(Key::Enter, 2, 0), CommandOutcome::Redraw);
         assert_eq!(browser.view_kind(), ViewKind::Detail);
-        assert_eq!(browser.handle_key(Key::Back, 2), CommandOutcome::Redraw);
+        assert_eq!(browser.handle_key(Key::Back, 2, 0), CommandOutcome::Redraw);
         assert_eq!(browser.feed_position(), (2, 1));
     }
 }

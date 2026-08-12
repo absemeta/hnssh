@@ -368,7 +368,11 @@ impl SessionActor {
                     }
                 }
                 ActorEvent::Input(key) => {
-                    match self.browser.handle_key(key, self.size.page_len()) {
+                    let detail_scroll_max = ui::detail_scroll_max(&self.browser, self.size.area());
+                    match self
+                        .browser
+                        .handle_key(key, self.size.page_len(), detail_scroll_max)
+                    {
                         CommandOutcome::Redraw => self.render().await?,
                         CommandOutcome::RefreshTopFeed => {
                             self.render().await?;

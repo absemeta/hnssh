@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use reqwest::{Client, Response, StatusCode, header};
 use serde::Deserialize;
 use tokio::sync::{Mutex, Semaphore, oneshot};
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep};
 
 use crate::content::{
     ContentError, ContentFreshness, ContentFuture, ContentSnapshot, ContentSource, EntryDetails,
@@ -16,8 +16,6 @@ use crate::content::{
 use crate::content_safety::{normalize_html, normalize_inline_text, validated_url};
 
 const PRODUCTION_ENDPOINT: &str = "https://hacker-news.firebaseio.com/v0";
-const MAX_POLL_OPTIONS: usize = 64;
-const POLL_OPTION_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resource, retry, and cache bounds for the Hacker News adapter.
 #[derive(Clone, Debug)]
@@ -201,29 +199,17 @@ impl HackerNewsContent {
         Box::pin(async move {
             let snapshot = self.item_request(id, request).await?;
             let mut poll_option_ids = Vec::new();
-            let mut poll_options_truncated = false;
             let mut entry = snapshot.try_map(|resource| match resource {
                 ResourceValue::Item { item, .. } => {
                     poll_option_ids = item.poll_option_ids;
-                    poll_options_truncated = item.poll_options_truncated;
                     Ok(item.entry)
                 }
                 ResourceValue::TopFeed(_) => Err(ContentError::Unavailable),
             })?;
 
             if let FeedEntry::Poll { options, .. } = &mut entry.value {
-                let option_count = poll_option_ids.len();
-                let load = async {
-                    for option_id in poll_option_ids {
-                        options.push(self.poll_option_request(option_id, request).await);
-                    }
-                };
-                let _ = timeout(POLL_OPTION_LOAD_TIMEOUT, load).await;
-                options.resize_with(option_count, || {
-                    PollOption::placeholder(PollOptionStatus::Retryable)
-                });
-                if poll_options_truncated {
-                    options.push(PollOption::placeholder(PollOptionStatus::LimitReached));
+                for option_id in poll_option_ids {
+                    options.push(self.poll_option_request(option_id, request).await);
                 }
             }
 
@@ -287,7 +273,6 @@ struct CachedItem {
     entry: FeedEntry,
     poll_option: Option<PollOption>,
     poll_option_ids: Vec<FeedEntryId>,
-    poll_options_truncated: bool,
 }
 
 impl CachedItem {
@@ -296,7 +281,6 @@ impl CachedItem {
             entry: FeedEntry::Unavailable { id },
             poll_option: None,
             poll_option_ids: Vec::new(),
-            poll_options_truncated: false,
         }
     }
 }
@@ -356,7 +340,6 @@ impl UpstreamItem {
         };
         if item_type == "job" {
             details.score = None;
-            details.author = None;
             details.comment_count = None;
         }
         let poll_option = (item_type == "pollopt").then(|| {
@@ -369,13 +352,11 @@ impl UpstreamItem {
                     status: PollOptionStatus::Available,
                 })
         });
-        let mut poll_option_ids = if item_type == "poll" {
+        let poll_option_ids = if item_type == "poll" {
             self.parts.unwrap_or_default()
         } else {
             Vec::new()
         };
-        let poll_options_truncated = poll_option_ids.len() > MAX_POLL_OPTIONS;
-        poll_option_ids.truncate(MAX_POLL_OPTIONS);
 
         let entry = match item_type.as_str() {
             "story" => FeedEntry::Story(details),
@@ -394,7 +375,6 @@ impl UpstreamItem {
             entry,
             poll_option: poll_option.flatten(),
             poll_option_ids,
-            poll_options_truncated,
         })
     }
 }

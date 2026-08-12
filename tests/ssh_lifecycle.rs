@@ -973,6 +973,52 @@ async fn visitor_reads_safe_rich_live_content_and_only_validated_links() -> Test
 }
 
 #[tokio::test]
+async fn visitor_can_reach_the_end_of_a_long_detail_view() -> TestResult {
+    let mut routes = HashMap::new();
+    routes.insert("topstories".to_owned(), vec![FakeReply::json("[1]")]);
+    let text = (1..=100)
+        .map(|line| format!("<p>Detail line {line}</p>"))
+        .collect::<String>();
+    routes.insert(
+        "item/1".to_owned(),
+        vec![FakeReply::json(format!(
+            r#"{{"id":1,"type":"story","title":"Long detail","text":"{text}"}}"#
+        ))],
+    );
+    let fake = FakeHackerNews::start(routes).await?;
+    let content = Arc::new(HackerNewsContent::for_endpoint(fake.endpoint()));
+    let server = TestServer::start_with_content(content).await?;
+    let (connection, mut channel, mut terminal, mut raw_output) = open_terminal(&server).await?;
+
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Long detail").await?;
+    channel.data_bytes(&b"\r"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Detail line 1",
+    )
+    .await?;
+    channel.data_bytes(&b"G"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Detail line 100",
+    )
+    .await?;
+
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut raw_output).await?, 0);
+    connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await?;
+    fake.stop().await
+}
+
+#[tokio::test]
 async fn visitor_reads_live_poll_options_with_partial_failures() -> TestResult {
     let mut routes = HashMap::new();
     routes.insert("topstories".to_owned(), vec![FakeReply::json("[10,20]")]);
@@ -1037,7 +1083,7 @@ async fn visitor_reads_live_poll_options_with_partial_failures() -> TestResult {
     read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Type: Job").await?;
     let job = terminal.screen().contents();
     assert!(!job.contains("Score:"));
-    assert!(!job.contains("Author:"));
+    assert!(job.contains("Author: should-not-show"));
     assert!(!job.contains("Comments:"));
     assert!(!job.contains("Published:"));
 

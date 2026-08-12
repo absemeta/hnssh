@@ -219,7 +219,6 @@ pub enum PollOptionStatus {
     Stale { age: Duration },
     Unavailable,
     Retryable,
-    LimitReached,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,7 +233,6 @@ impl PollOption {
         let text = match status {
             PollOptionStatus::Unavailable => "[poll option unavailable]",
             PollOptionStatus::Retryable => "[poll option temporarily unavailable]",
-            PollOptionStatus::LimitReached => "[poll option safety limit reached]",
             PollOptionStatus::Available | PollOptionStatus::Stale { .. } => {
                 unreachable!("available poll options are not placeholders")
             }

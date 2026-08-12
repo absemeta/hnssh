@@ -16,6 +16,19 @@ pub(crate) fn page_len(rows: u16) -> usize {
     usize::from(rows.saturating_sub(3) / 2).max(1)
 }
 
+pub(crate) fn detail_scroll_max(browser: &Browser, size: Rect) -> u16 {
+    let Some(entry) = browser.current_entry() else {
+        return 0;
+    };
+    let width = usize::from(size.width.saturating_sub(2).max(1));
+    let visible_rows = usize::from(size.height.saturating_sub(3).max(1));
+    let content_rows = detail_lines(entry)
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum::<usize>();
+    u16::try_from(content_rows.saturating_sub(visible_rows)).unwrap_or(u16::MAX)
+}
+
 pub(crate) fn render(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
     if (size.width < MIN_COLUMNS || size.height < MIN_ROWS) && browser.view_kind() != ViewKind::Help
     {
@@ -135,61 +148,7 @@ fn render_detail(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
         return;
     };
 
-    let mut lines = vec![
-        Line::from(Span::styled(
-            entry.title(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(format!("Type: {}", entry.kind_label())),
-    ];
-    if let Some(details) = entry.details() {
-        append_detail_metadata(&mut lines, details);
-        if let Some(text) = &details.text {
-            lines.push(Line::from(""));
-            lines.extend(render_rich_text(text));
-        }
-        if details.omitted_link_count > 0 {
-            lines.push(Line::from(""));
-            lines.push(Line::from(format!(
-                "Unsafe or malformed links omitted: {}",
-                details.omitted_link_count
-            )));
-        }
-    }
-    if let FeedEntry::Poll { options, .. } = entry {
-        lines.push(Line::from(""));
-        lines.push(Line::from("Poll options:"));
-        for option in options {
-            let score = option
-                .score
-                .map(|score| format!(" — {}", points(score)))
-                .unwrap_or_default();
-            let status = match option.status {
-                PollOptionStatus::Available => String::new(),
-                PollOptionStatus::Stale { age } => {
-                    format!(" · stale · {} old", cache_age(age))
-                }
-                PollOptionStatus::Unavailable
-                | PollOptionStatus::Retryable
-                | PollOptionStatus::LimitReached => " · not loaded".to_owned(),
-            };
-            lines.push(Line::from(format!("• {}{score}{status}", option.text)));
-        }
-    }
-    lines.push(Line::from(""));
-    if entry.links().is_empty() {
-        lines.push(Line::from("No links available"));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "Enter  View links",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
-
-    let panel = Paragraph::new(lines)
+    let panel = Paragraph::new(detail_lines(entry))
         .scroll((browser.current_scroll(), 0))
         .wrap(Wrap { trim: false })
         .block(
@@ -296,7 +255,64 @@ fn feed_metadata(state: &FeedRowState) -> String {
     }
 }
 
-fn append_detail_metadata(lines: &mut Vec<Line<'_>>, details: &EntryDetails) {
+fn detail_lines(entry: &FeedEntry) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            entry.title().to_owned(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("Type: {}", entry.kind_label())),
+    ];
+    if let Some(details) = entry.details() {
+        append_detail_metadata(&mut lines, details);
+        if let Some(text) = &details.text {
+            lines.push(Line::from(""));
+            lines.extend(render_rich_text(text));
+        }
+        if details.omitted_link_count > 0 {
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "Unsafe or malformed links omitted: {}",
+                details.omitted_link_count
+            )));
+        }
+    }
+    if let FeedEntry::Poll { options, .. } = entry {
+        lines.push(Line::from(""));
+        lines.push(Line::from("Poll options:"));
+        for option in options {
+            let score = option
+                .score
+                .map(|score| format!(" — {}", points(score)))
+                .unwrap_or_default();
+            let status = match option.status {
+                PollOptionStatus::Available => String::new(),
+                PollOptionStatus::Stale { age } => {
+                    format!(" · stale · {} old", cache_age(age))
+                }
+                PollOptionStatus::Unavailable | PollOptionStatus::Retryable => {
+                    " · not loaded".to_owned()
+                }
+            };
+            lines.push(Line::from(format!("• {}{score}{status}", option.text)));
+        }
+    }
+    lines.push(Line::from(""));
+    if entry.links().is_empty() {
+        lines.push(Line::from("No links available"));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Enter  View links",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines
+}
+
+fn append_detail_metadata(lines: &mut Vec<Line<'static>>, details: &EntryDetails) {
     if let Some(source) = &details.source {
         lines.push(Line::from(format!("Source: {source}")));
     }
