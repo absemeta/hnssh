@@ -19,8 +19,8 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::browser::{Browser, CommandOutcome};
-use crate::content::{ContentError, ContentSource, FeedEntry, FeedEntryId};
+use crate::browser::{Browser, CommandOutcome, ContentUpdate, FeedEntryLoad};
+use crate::content::{ContentError, ContentSnapshot, ContentSource, FeedEntry, FeedEntryId};
 use crate::hacker_news::HackerNewsContent;
 use crate::input::{InputDecoder, Key};
 use crate::ui;
@@ -249,12 +249,26 @@ fn clamp_dimension(value: u32, previous: u16, maximum: u16) -> u16 {
     }
 }
 
+fn needs_background_revalidation<T>(
+    result: &Result<ContentSnapshot<T>, ContentError>,
+    update: ContentUpdate,
+) -> bool {
+    update == ContentUpdate::Initial
+        && result
+            .as_ref()
+            .is_ok_and(|snapshot| snapshot.freshness.is_stale())
+}
+
 enum ActorEvent {
-    TopFeed(Result<Vec<FeedEntryId>, ContentError>),
+    TopFeed {
+        result: Result<ContentSnapshot<Vec<FeedEntryId>>, ContentError>,
+        update: ContentUpdate,
+    },
     FeedEntry {
         index: usize,
         id: FeedEntryId,
-        result: Result<FeedEntry, ContentError>,
+        result: Result<ContentSnapshot<FeedEntry>, ContentError>,
+        update: ContentUpdate,
     },
     Input(Key),
     Resize(TerminalSize),
@@ -273,6 +287,7 @@ struct SessionActor {
     channel: ChannelId,
     size: TerminalSize,
     source: Arc<dyn ContentSource>,
+    item_limit: Arc<Semaphore>,
     browser: Browser,
     terminal: RemoteTerminal,
     output: OutputBuffer,
@@ -299,6 +314,7 @@ impl SessionActor {
             channel,
             size,
             source,
+            item_limit: Arc::new(Semaphore::new(PAGE_ITEM_CONCURRENCY)),
             browser: Browser::new(),
             terminal,
             output,
@@ -312,32 +328,56 @@ impl SessionActor {
         event_sender: UnboundedSender<ActorEvent>,
     ) -> Result<(), ActorError> {
         self.render().await?;
-        self.load_top_feed(event_sender.clone());
+        self.load_top_feed(event_sender.clone(), ContentUpdate::Initial);
 
         while let Some(event) = events.recv().await {
             match event {
-                ActorEvent::TopFeed(result) => {
-                    let result = result.map(|mut ids| {
-                        ids.truncate(TOP_FEED_PAGE_SIZE);
-                        ids
-                    });
-                    let ids = result.as_ref().ok().cloned();
-                    self.browser.set_top_feed(result);
+                ActorEvent::TopFeed { result, update } => {
+                    let revalidate = needs_background_revalidation(&result, update);
+                    let loaded = result.is_ok();
+                    self.browser
+                        .set_top_feed(result, TOP_FEED_PAGE_SIZE, update);
                     self.render().await?;
-                    if let Some(ids) = ids {
-                        self.load_entries(ids, &event_sender);
+                    if loaded {
+                        self.load_entries(self.browser.loaded_entries(), &event_sender, update);
+                    }
+                    if revalidate {
+                        self.browser.begin_top_feed_revalidation();
+                        self.render().await?;
+                        self.load_top_feed(event_sender.clone(), ContentUpdate::Revalidation);
                     }
                 }
-                ActorEvent::FeedEntry { index, id, result } => {
-                    self.browser.set_feed_entry(index, id, result);
+                ActorEvent::FeedEntry {
+                    index,
+                    id,
+                    result,
+                    update,
+                } => {
+                    let revalidate = needs_background_revalidation(&result, update);
+                    self.browser.set_feed_entry(index, id, result, update);
+                    if revalidate {
+                        self.browser.begin_entry_revalidation();
+                    }
                     self.render().await?;
+                    if revalidate {
+                        self.load_entry(
+                            FeedEntryLoad { index, id },
+                            event_sender.clone(),
+                            ContentUpdate::Revalidation,
+                        );
+                    }
                 }
                 ActorEvent::Input(key) => {
                     match self.browser.handle_key(key, self.size.page_len()) {
                         CommandOutcome::Redraw => self.render().await?,
-                        CommandOutcome::ReloadTopFeed => {
+                        CommandOutcome::RefreshTopFeed => {
                             self.render().await?;
-                            self.load_top_feed(event_sender.clone());
+                            self.load_top_feed(event_sender.clone(), ContentUpdate::Revalidation);
+                        }
+                        CommandOutcome::LoadNextPage => {
+                            let entries = self.browser.load_next_page(TOP_FEED_PAGE_SIZE);
+                            self.render().await?;
+                            self.load_entries(entries, &event_sender, ContentUpdate::Initial);
                         }
                         CommandOutcome::Unchanged => {}
                         CommandOutcome::Quit => {
@@ -358,28 +398,62 @@ impl SessionActor {
         Ok(())
     }
 
-    fn load_top_feed(&self, events: UnboundedSender<ActorEvent>) {
+    fn load_top_feed(&self, events: UnboundedSender<ActorEvent>, update: ContentUpdate) {
         let source = Arc::clone(&self.source);
         tokio::spawn(async move {
-            let result = source.top_feed().await;
-            let _ = events.send(ActorEvent::TopFeed(result));
+            let result = match update {
+                ContentUpdate::Initial => source.top_feed().await,
+                ContentUpdate::Revalidation => source.refresh_top_feed().await,
+            };
+            let _ = events.send(ActorEvent::TopFeed { result, update });
         });
     }
 
-    fn load_entries(&self, ids: Vec<FeedEntryId>, events: &UnboundedSender<ActorEvent>) {
-        let page_limit = Arc::new(Semaphore::new(PAGE_ITEM_CONCURRENCY));
-        for (index, id) in ids.into_iter().enumerate() {
-            let source = Arc::clone(&self.source);
-            let events = events.clone();
-            let page_limit = Arc::clone(&page_limit);
-            tokio::spawn(async move {
-                let result = match page_limit.acquire_owned().await {
-                    Ok(_permit) => source.feed_entry(id).await,
-                    Err(_) => Err(ContentError::Retryable),
-                };
-                let _ = events.send(ActorEvent::FeedEntry { index, id, result });
-            });
+    fn load_entries(
+        &self,
+        entries: Vec<FeedEntryLoad>,
+        events: &UnboundedSender<ActorEvent>,
+        update: ContentUpdate,
+    ) {
+        for entry in entries {
+            self.load_entry(entry, events.clone(), update);
         }
+    }
+
+    fn load_entry(
+        &self,
+        entry: FeedEntryLoad,
+        events: UnboundedSender<ActorEvent>,
+        update: ContentUpdate,
+    ) {
+        let FeedEntryLoad { index, id } = entry;
+        let source = Arc::clone(&self.source);
+        let item_limit = Arc::clone(&self.item_limit);
+        tokio::spawn(async move {
+            let permit = match item_limit.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let _ = events.send(ActorEvent::FeedEntry {
+                        index,
+                        id,
+                        result: Err(ContentError::Retryable),
+                        update,
+                    });
+                    return;
+                }
+            };
+            let result = match update {
+                ContentUpdate::Initial => source.feed_entry(id).await,
+                ContentUpdate::Revalidation => source.refresh_feed_entry(id).await,
+            };
+            drop(permit);
+            let _ = events.send(ActorEvent::FeedEntry {
+                index,
+                id,
+                result,
+                update,
+            });
+        });
     }
 
     async fn render(&mut self) -> Result<(), ActorError> {

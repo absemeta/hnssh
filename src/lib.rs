@@ -6,8 +6,8 @@ mod server;
 mod ui;
 
 pub use content::{
-    ContentError, ContentSource, EntryDetails, FeedEntry, FeedEntryId, FixtureContent, Link,
-    PollOption,
+    ContentError, ContentFreshness, ContentSnapshot, ContentSource, EntryDetails, FeedEntry,
+    FeedEntryId, FixtureContent, Link, PollOption,
 };
-pub use hacker_news::HackerNewsContent;
+pub use hacker_news::{HackerNewsContent, HackerNewsOptions};
 pub use server::{Server, ServerConfig, ServerError};

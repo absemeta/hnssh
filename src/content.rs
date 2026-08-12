@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 
@@ -14,9 +14,27 @@ pub(crate) type ContentFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + '
 /// details. The live adapter can therefore replace [`FixtureContent`] without
 /// changing navigation state.
 pub trait ContentSource: Send + Sync {
-    fn top_feed(&self) -> ContentFuture<'_, Result<Vec<FeedEntryId>, ContentError>>;
+    fn top_feed(
+        &self,
+    ) -> ContentFuture<'_, Result<ContentSnapshot<Vec<FeedEntryId>>, ContentError>>;
 
-    fn feed_entry(&self, id: FeedEntryId) -> ContentFuture<'_, Result<FeedEntry, ContentError>>;
+    fn refresh_top_feed(
+        &self,
+    ) -> ContentFuture<'_, Result<ContentSnapshot<Vec<FeedEntryId>>, ContentError>> {
+        self.top_feed()
+    }
+
+    fn feed_entry(
+        &self,
+        id: FeedEntryId,
+    ) -> ContentFuture<'_, Result<ContentSnapshot<FeedEntry>, ContentError>>;
+
+    fn refresh_feed_entry(
+        &self,
+        id: FeedEntryId,
+    ) -> ContentFuture<'_, Result<ContentSnapshot<FeedEntry>, ContentError>> {
+        self.feed_entry(id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -25,6 +43,93 @@ pub enum ContentError {
     Unavailable,
     #[error("content is temporarily unavailable")]
     Retryable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentFreshness {
+    Fresh,
+    Stale { age: Duration },
+}
+
+impl ContentFreshness {
+    pub fn is_fresh(self) -> bool {
+        matches!(self, Self::Fresh)
+    }
+
+    pub fn is_stale(self) -> bool {
+        matches!(self, Self::Stale { .. })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentSnapshot<T> {
+    pub value: T,
+    pub freshness: ContentFreshness,
+    cached_at: Instant,
+    stale_until: Option<Instant>,
+}
+
+impl<T> ContentSnapshot<T> {
+    pub fn fresh(value: T) -> Self {
+        Self {
+            value,
+            freshness: ContentFreshness::Fresh,
+            cached_at: Instant::now(),
+            stale_until: None,
+        }
+    }
+
+    pub fn current_age(&self) -> Duration {
+        Instant::now().saturating_duration_since(self.cached_at)
+    }
+
+    pub(crate) fn cached(
+        value: T,
+        freshness: ContentFreshness,
+        age: Duration,
+        stale_for: Duration,
+    ) -> Self {
+        let now = Instant::now();
+        let cached_at = now.checked_sub(age).unwrap_or(now);
+        Self {
+            value,
+            freshness,
+            cached_at,
+            stale_until: cached_at.checked_add(stale_for),
+        }
+    }
+
+    pub(crate) fn mark_stale(&mut self) {
+        self.freshness = ContentFreshness::Stale {
+            age: self.current_age(),
+        };
+    }
+
+    pub(crate) fn usable_after_failure(&self) -> bool {
+        self.stale_until
+            .is_none_or(|stale_until| Instant::now() <= stale_until)
+    }
+
+    pub(crate) fn metadata_only(&self) -> ContentSnapshot<()> {
+        ContentSnapshot {
+            value: (),
+            freshness: self.freshness,
+            cached_at: self.cached_at,
+            stale_until: self.stale_until,
+        }
+    }
+
+    pub(crate) fn try_map<U, E>(
+        self,
+        map: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<ContentSnapshot<U>, E> {
+        Ok(ContentSnapshot {
+            value: map(self.value)?,
+            freshness: self.freshness,
+            cached_at: self.cached_at,
+            stale_until: self.stale_until,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -310,16 +415,26 @@ impl FixtureContent {
 }
 
 impl ContentSource for FixtureContent {
-    fn top_feed(&self) -> ContentFuture<'_, Result<Vec<FeedEntryId>, ContentError>> {
-        Box::pin(async move { Ok(self.entries.iter().map(FeedEntry::id).collect()) })
+    fn top_feed(
+        &self,
+    ) -> ContentFuture<'_, Result<ContentSnapshot<Vec<FeedEntryId>>, ContentError>> {
+        Box::pin(async move {
+            Ok(ContentSnapshot::fresh(
+                self.entries.iter().map(FeedEntry::id).collect(),
+            ))
+        })
     }
 
-    fn feed_entry(&self, id: FeedEntryId) -> ContentFuture<'_, Result<FeedEntry, ContentError>> {
+    fn feed_entry(
+        &self,
+        id: FeedEntryId,
+    ) -> ContentFuture<'_, Result<ContentSnapshot<FeedEntry>, ContentError>> {
         Box::pin(async move {
             self.entries
                 .iter()
                 .find(|entry| entry.id() == id)
                 .cloned()
+                .map(ContentSnapshot::fresh)
                 .ok_or(ContentError::Unavailable)
         })
     }

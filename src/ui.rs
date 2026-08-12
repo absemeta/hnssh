@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::browser::{Browser, FeedRowState, FeedStatus, ViewKind};
-use crate::content::{EntryDetails, FeedEntry};
+use crate::content::{ContentFreshness, EntryDetails, FeedEntry};
 
 pub(crate) const MIN_COLUMNS: u16 = 60;
 pub(crate) const MIN_ROWS: u16 = 16;
@@ -56,8 +56,23 @@ fn render_resize(frame: &mut Frame<'_>, size: Rect) {
 
 fn render_feed(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(size);
+    let mut title_status = Vec::new();
+    if browser.is_refreshing() {
+        title_status.push("refreshing…".to_owned());
+    }
+    if let Some(ContentFreshness::Stale { .. }) = browser.top_feed_freshness() {
+        title_status.push(format!("stale · {} old", cache_age(browser.top_feed_age())));
+    }
+    if browser.refresh_failed() {
+        title_status.push("refresh failed".to_owned());
+    }
+    let suffix = if title_status.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", title_status.join(" · "))
+    };
     let block = Block::default()
-        .title(" HNSSH · Top feed ")
+        .title(format!(" HNSSH · Top feed{suffix} "))
         .borders(Borders::ALL);
     let inner = block.inner(body);
     frame.render_widget(block, body);
@@ -76,13 +91,7 @@ fn render_feed(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
         }
         FeedStatus::Ready => {
             let (selected, offset) = browser.feed_position();
-            for (index, row) in browser
-                .rows()
-                .iter()
-                .enumerate()
-                .skip(offset)
-                .take(page_len(size.height))
-            {
+            for index in (offset..browser.selectable_feed_len()).take(page_len(size.height)) {
                 let marker = if index == selected { ">" } else { " " };
                 let style = if index == selected {
                     Style::default()
@@ -91,17 +100,29 @@ fn render_feed(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
                 } else {
                     Style::default()
                 };
-                lines.push(Line::from(Span::styled(
-                    format!("{marker} {}. {}", row.rank, row.title()),
-                    style,
-                )));
-                lines.push(Line::from(format!("    {}", feed_metadata(&row.state))));
+                if let Some(row) = browser.rows().get(index) {
+                    lines.push(Line::from(Span::styled(
+                        format!("{marker} {}. {}", row.rank, row.title()),
+                        style,
+                    )));
+                    lines.push(Line::from(format!("    {}", feed_metadata(&row.state))));
+                } else if browser.has_more() {
+                    let count = browser.remaining_count().min(30);
+                    lines.push(Line::from(Span::styled(
+                        format!("{marker} Load {count} more entries"),
+                        style,
+                    )));
+                    lines.push(Line::from(format!(
+                        "    {} entries remain; Enter to load the next page",
+                        browser.remaining_count()
+                    )));
+                }
             }
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
     frame.render_widget(
-        Paragraph::new("j/k move · PgUp/PgDn page · Enter details · r retry · ? help · q quit")
+        Paragraph::new("j/k move · PgUp/PgDn page · Enter open/load · r refresh · ? help · q quit")
             .alignment(Alignment::Center),
         footer,
     );
@@ -222,7 +243,7 @@ fn render_help(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
         Line::from("Enter                  Open the selected entry or its links"),
         Line::from("Escape / Backspace     Return to the previous view"),
         Line::from("?                      Open this help"),
-        Line::from("r                      Retry an unavailable top feed"),
+        Line::from("r                      Refresh or retry the top feed"),
         Line::from("q                      Quit HNSSH"),
     ];
     let panel = Paragraph::new(lines)
@@ -240,12 +261,22 @@ fn feed_metadata(state: &FeedRowState) -> String {
     match state {
         FeedRowState::Loading => "waiting for Hacker News".to_owned(),
         FeedRowState::Unavailable => "unavailable".to_owned(),
-        FeedRowState::Retryable => "temporary failure · retry later".to_owned(),
-        FeedRowState::Ready(entry) => entry
-            .details()
-            .map(metadata)
-            .filter(|metadata| !metadata.is_empty())
-            .unwrap_or_else(|| entry.kind_label().to_owned()),
+        FeedRowState::Retryable => "temporary failure · retry with r".to_owned(),
+        FeedRowState::Ready(snapshot) => {
+            let mut label = snapshot
+                .value
+                .details()
+                .map(metadata)
+                .filter(|metadata| !metadata.is_empty())
+                .unwrap_or_else(|| snapshot.value.kind_label().to_owned());
+            if let ContentFreshness::Stale { .. } = snapshot.freshness {
+                label.push_str(&format!(
+                    " · stale · {} old",
+                    cache_age(snapshot.current_age())
+                ));
+            }
+            label
+        }
     }
 }
 
@@ -318,6 +349,17 @@ fn relative_age(published_at: SystemTime) -> String {
         quantity(seconds / (24 * 60 * 60), "day")
     } else {
         quantity(seconds / (365 * 24 * 60 * 60), "year")
+    }
+}
+
+fn cache_age(age: Duration) -> String {
+    let seconds = age.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}h", seconds / (60 * 60))
     }
 }
 

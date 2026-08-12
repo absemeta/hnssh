@@ -1,4 +1,8 @@
-use crate::content::{ContentError, FeedEntry, FeedEntryId, Link};
+use std::time::Duration;
+
+use crate::content::{
+    ContentError, ContentFreshness, ContentSnapshot, FeedEntry, FeedEntryId, Link,
+};
 use crate::input::Key;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11,7 +15,7 @@ pub(crate) enum FeedStatus {
 #[derive(Clone, Debug)]
 pub(crate) enum FeedRowState {
     Loading,
-    Ready(FeedEntry),
+    Ready(Box<ContentSnapshot<FeedEntry>>),
     Unavailable,
     Retryable,
 }
@@ -23,11 +27,17 @@ pub(crate) struct FeedRow {
     pub(crate) state: FeedRowState,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FeedEntryLoad {
+    pub(crate) index: usize,
+    pub(crate) id: FeedEntryId,
+}
+
 impl FeedRow {
     pub(crate) fn title(&self) -> &str {
         match &self.state {
             FeedRowState::Loading => "Loading feed entry…",
-            FeedRowState::Ready(entry) => entry.title(),
+            FeedRowState::Ready(snapshot) => snapshot.value.title(),
             FeedRowState::Unavailable => "[feed entry unavailable]",
             FeedRowState::Retryable => "[feed entry temporarily unavailable]",
         }
@@ -35,7 +45,7 @@ impl FeedRow {
 
     pub(crate) fn entry(&self) -> Option<&FeedEntry> {
         match &self.state {
-            FeedRowState::Ready(entry) => Some(entry),
+            FeedRowState::Ready(snapshot) => Some(&snapshot.value),
             FeedRowState::Loading | FeedRowState::Unavailable | FeedRowState::Retryable => None,
         }
     }
@@ -70,9 +80,16 @@ enum ViewState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContentUpdate {
+    Initial,
+    Revalidation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandOutcome {
     Redraw,
-    ReloadTopFeed,
+    RefreshTopFeed,
+    LoadNextPage,
     Unchanged,
     Quit,
 }
@@ -80,6 +97,11 @@ pub(crate) enum CommandOutcome {
 #[derive(Debug)]
 pub(crate) struct Browser {
     feed_status: FeedStatus,
+    top_feed_snapshot: Option<ContentSnapshot<()>>,
+    refreshing: bool,
+    pending_entry_revalidations: usize,
+    refresh_failed: bool,
+    all_ids: Vec<FeedEntryId>,
     rows: Vec<FeedRow>,
     views: Vec<ViewState>,
 }
@@ -88,6 +110,11 @@ impl Browser {
     pub(crate) fn new() -> Self {
         Self {
             feed_status: FeedStatus::Loading,
+            top_feed_snapshot: None,
+            refreshing: false,
+            pending_entry_revalidations: 0,
+            refresh_failed: false,
+            all_ids: Vec::new(),
             rows: Vec::new(),
             views: vec![ViewState::Feed {
                 selected: 0,
@@ -96,25 +123,91 @@ impl Browser {
         }
     }
 
-    pub(crate) fn set_top_feed(&mut self, result: Result<Vec<FeedEntryId>, ContentError>) {
+    pub(crate) fn set_top_feed(
+        &mut self,
+        result: Result<ContentSnapshot<Vec<FeedEntryId>>, ContentError>,
+        page_size: usize,
+        update: ContentUpdate,
+    ) {
+        if update == ContentUpdate::Initial {
+            self.refreshing = false;
+            self.pending_entry_revalidations = 0;
+        }
         match result {
-            Ok(ids) => {
-                self.feed_status = FeedStatus::Ready;
-                self.rows = ids
-                    .into_iter()
+            Ok(snapshot) => {
+                let selected_id = self.rows.get(self.feed_position().0).map(|row| row.id);
+                let loaded = if update == ContentUpdate::Revalidation {
+                    self.rows.len().max(page_size)
+                } else {
+                    page_size
+                };
+                let mut previous_rows = std::mem::take(&mut self.rows);
+                let top_feed_snapshot = snapshot.metadata_only();
+                self.all_ids = snapshot.value;
+                self.rows = self
+                    .all_ids
+                    .iter()
+                    .copied()
+                    .take(loaded)
                     .enumerate()
-                    .map(|(index, id)| FeedRow {
-                        rank: index + 1,
-                        id,
-                        state: FeedRowState::Loading,
+                    .map(|(index, id)| {
+                        let previous = previous_rows
+                            .iter()
+                            .position(|row| row.id == id)
+                            .map(|position| previous_rows.remove(position));
+                        FeedRow {
+                            rank: index + 1,
+                            id,
+                            state: previous
+                                .map(|row| row.state)
+                                .unwrap_or(FeedRowState::Loading),
+                        }
                     })
                     .collect();
+                self.feed_status = FeedStatus::Ready;
+                self.top_feed_snapshot = Some(top_feed_snapshot);
+                self.refresh_failed = false;
+                if update == ContentUpdate::Revalidation {
+                    self.pending_entry_revalidations = self.rows.len();
+                    self.refreshing = self.pending_entry_revalidations > 0;
+                }
+                if let Some(selected) =
+                    selected_id.and_then(|id| self.rows.iter().position(|row| row.id == id))
+                {
+                    let ViewState::Feed {
+                        selected: current, ..
+                    } = self
+                        .views
+                        .first_mut()
+                        .expect("browser always has a root view")
+                    else {
+                        unreachable!("the root view is always the feed")
+                    };
+                    *current = selected;
+                }
                 self.clamp_feed_selection(1);
             }
             Err(_) => {
-                self.feed_status = FeedStatus::Unavailable;
-                self.rows.clear();
-                self.clamp_feed_selection(1);
+                self.refreshing = false;
+                self.pending_entry_revalidations = 0;
+                let usable = !self.rows.is_empty()
+                    && self
+                        .top_feed_snapshot
+                        .as_ref()
+                        .is_some_and(ContentSnapshot::usable_after_failure);
+                if usable {
+                    self.feed_status = FeedStatus::Ready;
+                    if let Some(snapshot) = &mut self.top_feed_snapshot {
+                        snapshot.mark_stale();
+                    }
+                } else {
+                    self.feed_status = FeedStatus::Unavailable;
+                    self.top_feed_snapshot = None;
+                    self.all_ids.clear();
+                    self.rows.clear();
+                    self.clamp_feed_selection(1);
+                }
+                self.refresh_failed = true;
             }
         }
     }
@@ -123,7 +216,8 @@ impl Browser {
         &mut self,
         index: usize,
         id: FeedEntryId,
-        result: Result<FeedEntry, ContentError>,
+        result: Result<ContentSnapshot<FeedEntry>, ContentError>,
+        update: ContentUpdate,
     ) {
         let Some(row) = self.rows.get_mut(index) else {
             return;
@@ -132,22 +226,121 @@ impl Browser {
             return;
         }
 
-        row.state = match result {
-            Ok(FeedEntry::Unavailable { id: entry_id }) if entry_id == id => {
-                FeedRowState::Unavailable
-            }
-            Ok(entry) if entry.id() == id => FeedRowState::Ready(entry),
-            Err(ContentError::Retryable) => FeedRowState::Retryable,
-            Ok(_) | Err(ContentError::Unavailable) => FeedRowState::Unavailable,
-        };
+        let preserve = update == ContentUpdate::Revalidation
+            && result.is_err()
+            && matches!(
+                &row.state,
+                FeedRowState::Ready(snapshot) if snapshot.usable_after_failure()
+            );
+        if preserve {
+            let FeedRowState::Ready(snapshot) = &mut row.state else {
+                unreachable!("the preserve guard requires a ready row")
+            };
+            snapshot.mark_stale();
+        } else {
+            row.state = match result {
+                Ok(ContentSnapshot {
+                    value: FeedEntry::Unavailable { id: entry_id },
+                    ..
+                }) if entry_id == id => FeedRowState::Unavailable,
+                Ok(snapshot) if snapshot.value.id() == id => {
+                    FeedRowState::Ready(Box::new(snapshot))
+                }
+                Err(ContentError::Retryable) => FeedRowState::Retryable,
+                Ok(_) | Err(ContentError::Unavailable) => FeedRowState::Unavailable,
+            };
+        }
+
+        if update == ContentUpdate::Revalidation {
+            self.pending_entry_revalidations = self.pending_entry_revalidations.saturating_sub(1);
+            self.refreshing = self.pending_entry_revalidations > 0;
+        }
     }
 
     pub(crate) fn feed_status(&self) -> FeedStatus {
         self.feed_status
     }
 
+    pub(crate) fn top_feed_freshness(&self) -> Option<ContentFreshness> {
+        self.top_feed_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.freshness)
+    }
+
+    pub(crate) fn top_feed_age(&self) -> Duration {
+        self.top_feed_snapshot
+            .as_ref()
+            .map(ContentSnapshot::current_age)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    pub(crate) fn is_refreshing(&self) -> bool {
+        self.refreshing
+    }
+
+    pub(crate) fn begin_top_feed_revalidation(&mut self) {
+        self.refreshing = true;
+        self.pending_entry_revalidations = 0;
+        self.refresh_failed = false;
+        if self.rows.is_empty() {
+            self.feed_status = FeedStatus::Loading;
+        }
+    }
+
+    pub(crate) fn begin_entry_revalidation(&mut self) {
+        self.pending_entry_revalidations = self.pending_entry_revalidations.saturating_add(1);
+        self.refreshing = true;
+    }
+
+    pub(crate) fn refresh_failed(&self) -> bool {
+        self.refresh_failed
+    }
+
     pub(crate) fn rows(&self) -> &[FeedRow] {
         &self.rows
+    }
+
+    pub(crate) fn has_more(&self) -> bool {
+        self.rows.len() < self.all_ids.len()
+    }
+
+    pub(crate) fn remaining_count(&self) -> usize {
+        self.all_ids.len().saturating_sub(self.rows.len())
+    }
+
+    pub(crate) fn selectable_feed_len(&self) -> usize {
+        self.rows.len() + usize::from(self.has_more())
+    }
+
+    pub(crate) fn loaded_entries(&self) -> Vec<FeedEntryLoad> {
+        self.rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| FeedEntryLoad { index, id: row.id })
+            .collect()
+    }
+
+    pub(crate) fn load_next_page(&mut self, page_size: usize) -> Vec<FeedEntryLoad> {
+        let start = self.rows.len();
+        let end = start.saturating_add(page_size).min(self.all_ids.len());
+        self.rows
+            .extend(
+                self.all_ids[start..end]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(offset, id)| FeedRow {
+                        rank: start + offset + 1,
+                        id,
+                        state: FeedRowState::Loading,
+                    }),
+            );
+        (start..end)
+            .map(|index| FeedEntryLoad {
+                index,
+                id: self.all_ids[index],
+            })
+            .collect()
     }
 
     pub(crate) fn view_kind(&self) -> ViewKind {
@@ -199,12 +392,12 @@ impl Browser {
         if key == Key::Quit {
             return CommandOutcome::Quit;
         }
-        if key == Key::Refresh
-            && self.view_kind() == ViewKind::Feed
-            && self.feed_status == FeedStatus::Unavailable
-        {
-            self.feed_status = FeedStatus::Loading;
-            return CommandOutcome::ReloadTopFeed;
+        if key == Key::Refresh && self.view_kind() == ViewKind::Feed {
+            if self.refreshing {
+                return CommandOutcome::Unchanged;
+            }
+            self.begin_top_feed_revalidation();
+            return CommandOutcome::RefreshTopFeed;
         }
         if key == Key::Help {
             if self.view_kind() == ViewKind::Help {
@@ -232,6 +425,9 @@ impl Browser {
     fn handle_feed_key(&mut self, key: Key, page_len: usize) -> CommandOutcome {
         if key == Key::Enter {
             let (selected, _) = self.feed_position();
+            if selected == self.rows.len() && self.has_more() {
+                return CommandOutcome::LoadNextPage;
+            }
             if self.rows.get(selected).and_then(FeedRow::entry).is_some() {
                 self.views.push(ViewState::Detail {
                     row: selected,
@@ -242,7 +438,7 @@ impl Browser {
             return CommandOutcome::Unchanged;
         }
 
-        let last = self.rows.len().saturating_sub(1);
+        let last = self.selectable_feed_len().saturating_sub(1);
         let ViewState::Feed { selected, offset } = self
             .views
             .first_mut()
@@ -333,7 +529,7 @@ impl Browser {
     }
 
     fn clamp_feed_selection(&mut self, page_len: usize) {
-        let last = self.rows.len().saturating_sub(1);
+        let last = self.selectable_feed_len().saturating_sub(1);
         let ViewState::Feed { selected, offset } = self
             .views
             .first_mut()
@@ -382,19 +578,48 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn expired_session_copy_is_removed_after_refresh_failure() {
+        let mut browser = Browser::new();
+        browser.set_top_feed(
+            Ok(ContentSnapshot::cached(
+                vec![101],
+                ContentFreshness::Fresh,
+                Duration::from_millis(20),
+                Duration::from_millis(10),
+            )),
+            30,
+            ContentUpdate::Initial,
+        );
+
+        browser.set_top_feed(
+            Err(ContentError::Retryable),
+            30,
+            ContentUpdate::Revalidation,
+        );
+
+        assert_eq!(browser.feed_status(), FeedStatus::Unavailable);
+        assert!(browser.rows().is_empty());
+    }
+
     #[tokio::test]
     async fn loading_resolution_keeps_rank_selection_and_back_stack_state() {
         let fixtures = FixtureContent::at(SystemTime::UNIX_EPOCH);
         let ids = fixtures.top_feed().await.expect("fixture feed");
         let mut browser = Browser::new();
-        browser.set_top_feed(Ok(ids.clone()));
+        browser.set_top_feed(Ok(ids.clone()), 30, ContentUpdate::Initial);
 
         browser.handle_key(Key::Down, 2);
         browser.handle_key(Key::Down, 2);
         assert_eq!(browser.feed_position(), (2, 1));
 
-        for (index, id) in ids.into_iter().enumerate() {
-            browser.set_feed_entry(index, id, fixtures.feed_entry(id).await);
+        for (index, id) in ids.value.into_iter().enumerate() {
+            browser.set_feed_entry(
+                index,
+                id,
+                fixtures.feed_entry(id).await,
+                ContentUpdate::Initial,
+            );
         }
         assert_eq!(browser.feed_position(), (2, 1));
 

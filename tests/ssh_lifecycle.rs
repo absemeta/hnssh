@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Path, State};
@@ -14,8 +14,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use hnssh::{
-    ContentError, ContentSource, FeedEntry, FeedEntryId, FixtureContent, HackerNewsContent, Server,
-    ServerConfig,
+    ContentError, ContentSnapshot, ContentSource, FeedEntry, FeedEntryId, FixtureContent,
+    HackerNewsContent, HackerNewsOptions, Server, ServerConfig,
 };
 use russh::client;
 use russh::keys::{Algorithm, PrivateKey, ssh_key};
@@ -108,14 +108,21 @@ struct GatedFixtureContent {
 impl ContentSource for GatedFixtureContent {
     fn top_feed(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<FeedEntryId>, ContentError>> + Send + '_>> {
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ContentSnapshot<Vec<FeedEntryId>>, ContentError>>
+                + Send
+                + '_,
+        >,
+    > {
         self.fixture.top_feed()
     }
 
     fn feed_entry(
         &self,
         id: FeedEntryId,
-    ) -> Pin<Box<dyn Future<Output = Result<FeedEntry, ContentError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<ContentSnapshot<FeedEntry>, ContentError>> + Send + '_>>
+    {
         Box::pin(async move {
             let permit = self
                 .entry_gate
@@ -133,6 +140,7 @@ struct FakeReply {
     status: StatusCode,
     body: String,
     delay: Duration,
+    retry_after: Option<String>,
 }
 
 impl FakeReply {
@@ -141,6 +149,7 @@ impl FakeReply {
             status: StatusCode::OK,
             body: body.into(),
             delay: Duration::ZERO,
+            retry_after: None,
         }
     }
 
@@ -149,6 +158,7 @@ impl FakeReply {
             status,
             body: "null".to_owned(),
             delay: Duration::ZERO,
+            retry_after: None,
         }
     }
 
@@ -156,11 +166,17 @@ impl FakeReply {
         self.delay = delay;
         self
     }
+
+    fn retry_after(mut self, value: impl Into<String>) -> Self {
+        self.retry_after = Some(value.into());
+        self
+    }
 }
 
 struct FakeHackerNewsState {
     replies: Mutex<HashMap<String, VecDeque<FakeReply>>>,
     requests: Mutex<HashMap<String, usize>>,
+    request_times: Mutex<HashMap<String, Vec<Instant>>>,
     active_items: AtomicUsize,
     maximum_active_items: AtomicUsize,
 }
@@ -182,6 +198,7 @@ impl FakeHackerNews {
                     .collect(),
             ),
             requests: Mutex::new(HashMap::new()),
+            request_times: Mutex::new(HashMap::new()),
             active_items: AtomicUsize::new(0),
             maximum_active_items: AtomicUsize::new(0),
         });
@@ -221,6 +238,16 @@ impl FakeHackerNews {
             .unwrap_or(0)
     }
 
+    fn request_times(&self, path: &str) -> Vec<Instant> {
+        self.state
+            .request_times
+            .lock()
+            .expect("fake request-time lock")
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn maximum_active_items(&self) -> usize {
         self.state.maximum_active_items.load(Ordering::SeqCst)
     }
@@ -257,6 +284,13 @@ async fn fake_response(
         .expect("fake request lock")
         .entry(path.clone())
         .or_default() += 1;
+    state
+        .request_times
+        .lock()
+        .expect("fake request-time lock")
+        .entry(path.clone())
+        .or_default()
+        .push(Instant::now());
     let reply = {
         let mut replies = state.replies.lock().expect("fake reply lock");
         replies.get_mut(&path).and_then(|replies| {
@@ -280,12 +314,18 @@ async fn fake_response(
         sleep(reply.delay).await;
     }
 
-    (
-        reply.status,
-        [("content-type", "application/json")],
-        reply.body,
-    )
-        .into_response()
+    let mut response = (reply.status, reply.body).into_response();
+    response.headers_mut().insert(
+        "content-type",
+        "application/json".parse().expect("static content type"),
+    );
+    if let Some(retry_after) = reply.retry_after {
+        response.headers_mut().insert(
+            "retry-after",
+            retry_after.parse().expect("test Retry-After value"),
+        );
+    }
+    response
 }
 
 fn make_host_key() -> TestResult<(TempDir, PathBuf, ssh_key::PublicKey)> {
@@ -326,6 +366,42 @@ async fn read_until_visible(
                 raw_output.extend_from_slice(&data);
                 terminal.process(&data);
                 if terminal.screen().contents().contains(expected) {
+                    return Ok::<_, Box<dyn std::error::Error>>(());
+                }
+            }
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+fn row_metadata_contains(screen: &str, row: &str, metadata: &str) -> bool {
+    let mut lines = screen.lines();
+    while let Some(line) = lines.next() {
+        if line.contains(row) {
+            return lines.next().is_some_and(|line| line.contains(metadata));
+        }
+    }
+    false
+}
+
+async fn read_until_row_metadata(
+    channel: &mut Channel<client::Msg>,
+    terminal: &mut vt100::Parser,
+    raw_output: &mut Vec<u8>,
+    row: &str,
+    metadata: &str,
+) -> TestResult {
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            let message = channel
+                .wait()
+                .await
+                .ok_or("SSH channel closed before expected row metadata appeared")?;
+            if let ChannelMsg::Data { data } = message {
+                raw_output.extend_from_slice(&data);
+                terminal.process(&data);
+                if row_metadata_contains(&terminal.screen().contents(), row, metadata) {
                     return Ok::<_, Box<dyn std::error::Error>>(());
                 }
             }
@@ -796,11 +872,21 @@ async fn live_feed_loads_progressively_in_upstream_order_with_bounded_item_work(
         "6. [title unavailable]",
     )
     .await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "5. [feed entry temporarily unavailable]",
+    )
+    .await?;
     let screen = terminal.screen().contents();
     assert!(screen.contains("> 2. Second live entry"));
     assert!(screen.contains("2. Second live entry"));
-    assert!(screen.contains("sparse"));
-    assert!(!screen.contains("0 points"));
+    let sparse_metadata = screen
+        .lines()
+        .find(|line| line.contains("sparse"))
+        .expect("sparse entry metadata");
+    assert!(!sparse_metadata.contains("points"));
     assert!(screen.contains("3. [feed entry unavailable]"));
     assert!(screen.contains("5. [feed entry temporarily unavailable]"));
     assert!(screen.contains("6. [title unavailable]"));
@@ -891,6 +977,7 @@ async fn unavailable_live_feed_can_be_retried_without_restarting_the_process() -
         "topstories".to_owned(),
         vec![
             FakeReply::status(StatusCode::SERVICE_UNAVAILABLE),
+            FakeReply::status(StatusCode::SERVICE_UNAVAILABLE),
             FakeReply::json("[1]"),
         ],
     );
@@ -921,7 +1008,7 @@ async fn unavailable_live_feed_can_be_retried_without_restarting_the_process() -
         "Recovered live feed",
     )
     .await?;
-    assert_eq!(fake.request_count("topstories"), 2);
+    assert_eq!(fake.request_count("topstories"), 3);
 
     channel.data_bytes(&b"q"[..]).await?;
     assert_eq!(read_through_close(&mut channel, &mut raw_output).await?, 0);
@@ -930,6 +1017,572 @@ async fn unavailable_live_feed_can_be_retried_without_restarting_the_process() -
         .await
         .ok();
     server.stop().await?;
+    fake.stop().await
+}
+
+fn fast_hacker_news_options() -> HackerNewsOptions {
+    HackerNewsOptions {
+        request_timeout: Duration::from_millis(100),
+        retry_base_delay: Duration::from_millis(5),
+        maximum_retry_delay: Duration::from_millis(30),
+        top_feed_fresh_for: Duration::from_secs(60),
+        top_feed_stale_for: Duration::from_secs(15 * 60),
+        item_fresh_for: Duration::from_secs(2 * 60),
+        comment_fresh_for: Duration::from_secs(5 * 60),
+        poll_option_fresh_for: Duration::from_secs(5 * 60),
+        item_stale_for: Duration::from_secs(30 * 60),
+        revalidation_interval: Duration::from_millis(80),
+        maximum_cache_entries: 20_000,
+        maximum_cache_weight: 64 * 1024 * 1024,
+        upstream_concurrency: 16,
+    }
+}
+
+#[tokio::test]
+async fn visitor_loads_top_feed_metadata_in_explicit_thirty_entry_pages() -> TestResult {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "topstories".to_owned(),
+        vec![FakeReply::json(format!(
+            "[{}]",
+            (1..=65)
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))],
+    );
+    for id in 1..=65 {
+        routes.insert(
+            format!("item/{id}"),
+            vec![FakeReply::json(format!(
+                r#"{{"id":{id},"type":"story","title":"Paged entry {id}"}}"#
+            ))],
+        );
+    }
+
+    let fake = FakeHackerNews::start(routes).await?;
+    let content = Arc::new(HackerNewsContent::for_endpoint(fake.endpoint()));
+    let server = TestServer::start_with_content(content).await?;
+    let (connection, mut channel, mut terminal, mut raw_output) = open_terminal(&server).await?;
+
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Paged entry 1",
+    )
+    .await?;
+    assert_eq!(fake.request_count("item/31"), 0);
+
+    channel.data_bytes(&b"G"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "> Load 30 more entries",
+    )
+    .await?;
+    channel.data_bytes(&b"\r"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "> 31. Paged entry 31",
+    )
+    .await?;
+    assert_eq!(fake.request_count("item/31"), 1);
+    assert_eq!(fake.request_count("item/61"), 0);
+
+    channel.data_bytes(&b"G"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "> Load 5 more entries",
+    )
+    .await?;
+    channel.data_bytes(&b"\r"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "> 61. Paged entry 61",
+    )
+    .await?;
+    assert_eq!(fake.request_count("item/65"), 1);
+
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut raw_output).await?, 0);
+    connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await?;
+    fake.stop().await
+}
+
+#[tokio::test]
+async fn refresh_is_coalesced_throttled_and_keeps_failed_content_visibly_stale() -> TestResult {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "topstories".to_owned(),
+        vec![
+            FakeReply::json("[1,2]"),
+            FakeReply::status(StatusCode::SERVICE_UNAVAILABLE).delayed(Duration::from_millis(20)),
+            FakeReply::status(StatusCode::SERVICE_UNAVAILABLE).delayed(Duration::from_millis(20)),
+            FakeReply::json("[2,3]"),
+        ],
+    );
+    routes.insert(
+        "item/1".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":1,"type":"story","title":"Still usable entry"}"#,
+        )],
+    );
+    routes.insert(
+        "item/2".to_owned(),
+        vec![
+            FakeReply::json(r#"{"id":2,"type":"story","title":"Selected entry"}"#),
+            FakeReply::status(StatusCode::SERVICE_UNAVAILABLE),
+            FakeReply::status(StatusCode::SERVICE_UNAVAILABLE),
+            FakeReply::json(r#"{"id":2,"type":"story","title":"Selected entry refreshed"}"#),
+        ],
+    );
+    routes.insert(
+        "item/3".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":3,"type":"story","title":"Recovered ranking"}"#,
+        )],
+    );
+
+    let fake = FakeHackerNews::start(routes).await?;
+    let content = Arc::new(HackerNewsContent::for_endpoint_with_options(
+        fake.endpoint(),
+        fast_hacker_news_options(),
+    ));
+    let server = TestServer::start_with_content(content).await?;
+    let first = open_terminal(&server).await?;
+    let second = open_terminal(&server).await?;
+    let (first_connection, mut first_channel, mut first_terminal, mut first_output) = first;
+    let (second_connection, mut second_channel, mut second_terminal, mut second_output) = second;
+
+    let (first_ready, second_ready) = tokio::join!(
+        read_until_visible(
+            &mut first_channel,
+            &mut first_terminal,
+            &mut first_output,
+            "Still usable entry",
+        ),
+        read_until_visible(
+            &mut second_channel,
+            &mut second_terminal,
+            &mut second_output,
+            "Still usable entry",
+        )
+    );
+    first_ready?;
+    second_ready?;
+    first_channel.data_bytes(&b"j"[..]).await?;
+    second_channel.data_bytes(&b"j"[..]).await?;
+    let (first_selected, second_selected) = tokio::join!(
+        read_until_visible(
+            &mut first_channel,
+            &mut first_terminal,
+            &mut first_output,
+            "> 2. Selected entry",
+        ),
+        read_until_visible(
+            &mut second_channel,
+            &mut second_terminal,
+            &mut second_output,
+            "> 2. Selected entry",
+        )
+    );
+    first_selected?;
+    second_selected?;
+
+    first_channel.data_bytes(&b"r"[..]).await?;
+    second_channel.data_bytes(&b"r"[..]).await?;
+    let (first_refreshing, second_refreshing) = tokio::join!(
+        read_until_visible(
+            &mut first_channel,
+            &mut first_terminal,
+            &mut first_output,
+            "refreshing",
+        ),
+        read_until_visible(
+            &mut second_channel,
+            &mut second_terminal,
+            &mut second_output,
+            "refreshing",
+        )
+    );
+    first_refreshing?;
+    second_refreshing?;
+    let (first_stale, second_stale) = tokio::join!(
+        read_until_visible(
+            &mut first_channel,
+            &mut first_terminal,
+            &mut first_output,
+            "stale",
+        ),
+        read_until_visible(
+            &mut second_channel,
+            &mut second_terminal,
+            &mut second_output,
+            "stale",
+        )
+    );
+    first_stale?;
+    second_stale?;
+    assert!(
+        first_terminal.screen().contents().contains("refreshing"),
+        "refresh progress should remain visible while entry metadata revalidates"
+    );
+    assert!(
+        first_terminal
+            .screen()
+            .contents()
+            .contains("> 2. Selected entry")
+    );
+    assert!(
+        second_terminal
+            .screen()
+            .contents()
+            .contains("> 2. Selected entry")
+    );
+    read_until_row_metadata(
+        &mut first_channel,
+        &mut first_terminal,
+        &mut first_output,
+        "> 2. Selected entry",
+        "stale",
+    )
+    .await?;
+    assert!(row_metadata_contains(
+        &first_terminal.screen().contents(),
+        "> 2. Selected entry",
+        "old"
+    ));
+    assert_eq!(fake.request_count("topstories"), 3);
+
+    first_channel.data_bytes(&b"r"[..]).await?;
+    sleep(Duration::from_millis(30)).await;
+    assert_eq!(
+        fake.request_count("topstories"),
+        3,
+        "revalidation is throttled for the same resource"
+    );
+
+    sleep(Duration::from_millis(70)).await;
+    first_channel.data_bytes(&b"r"[..]).await?;
+    read_until_visible(
+        &mut first_channel,
+        &mut first_terminal,
+        &mut first_output,
+        "Selected entry refreshed",
+    )
+    .await?;
+    assert!(
+        first_terminal
+            .screen()
+            .contents()
+            .contains("> 1. Selected entry refreshed"),
+        "refresh should keep focus on the selected feed entry as its rank changes"
+    );
+    assert_eq!(fake.request_count("topstories"), 4);
+
+    first_channel.data_bytes(&b"q"[..]).await?;
+    second_channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(
+        read_through_close(&mut first_channel, &mut first_output).await?,
+        0
+    );
+    assert_eq!(
+        read_through_close(&mut second_channel, &mut second_output).await?,
+        0
+    );
+    first_connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    second_connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await?;
+    fake.stop().await
+}
+
+#[tokio::test]
+async fn upstream_retry_classification_timeout_and_retry_after_are_bounded() -> TestResult {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "item/1".to_owned(),
+        vec![
+            FakeReply::status(StatusCode::INTERNAL_SERVER_ERROR),
+            FakeReply::json(r#"{"id":1,"type":"story","title":"Retried 5xx"}"#),
+        ],
+    );
+    routes.insert(
+        "item/2".to_owned(),
+        vec![
+            FakeReply::status(StatusCode::TOO_MANY_REQUESTS).retry_after("999"),
+            FakeReply::json(r#"{"id":2,"type":"story","title":"Retried 429"}"#),
+        ],
+    );
+    routes.insert(
+        "item/3".to_owned(),
+        vec![
+            FakeReply::status(StatusCode::NOT_FOUND),
+            FakeReply::json(r#"{"id":3,"type":"story","title":"Not blindly retried"}"#),
+        ],
+    );
+    routes.insert("item/4".to_owned(), vec![FakeReply::json("null")]);
+    routes.insert("item/5".to_owned(), vec![FakeReply::json("{malformed")]);
+    routes.insert(
+        "item/6".to_owned(),
+        vec![FakeReply::json("null").delayed(Duration::from_millis(100))],
+    );
+    routes.insert(
+        "item/7".to_owned(),
+        vec![
+            FakeReply::status(StatusCode::NOT_FOUND),
+            FakeReply::status(StatusCode::NOT_FOUND),
+            FakeReply::json(r#"{"id":7,"type":"story","title":"Throttled recovery"}"#),
+        ],
+    );
+
+    let fake = FakeHackerNews::start(routes).await?;
+    let mut options = fast_hacker_news_options();
+    options.request_timeout = Duration::from_millis(20);
+    let content = HackerNewsContent::for_endpoint_with_options(fake.endpoint(), options);
+
+    assert!(content.feed_entry(1).await.is_ok());
+    assert!(content.feed_entry(2).await.is_ok());
+    assert_eq!(content.feed_entry(3).await, Err(ContentError::Unavailable));
+    assert!(matches!(
+        content.feed_entry(4).await?.value,
+        FeedEntry::Unavailable { id: 4 }
+    ));
+    assert_eq!(content.feed_entry(5).await, Err(ContentError::Unavailable));
+    assert_eq!(content.feed_entry(6).await, Err(ContentError::Retryable));
+    assert_eq!(content.feed_entry(7).await, Err(ContentError::Unavailable));
+    assert_eq!(
+        content.refresh_feed_entry(7).await,
+        Err(ContentError::Unavailable)
+    );
+    assert_eq!(
+        content.refresh_feed_entry(7).await,
+        Err(ContentError::Unavailable)
+    );
+    assert_eq!(fake.request_count("item/7"), 2);
+    sleep(Duration::from_millis(90)).await;
+    assert_eq!(
+        content.refresh_feed_entry(7).await?.value.title(),
+        "Throttled recovery"
+    );
+
+    assert_eq!(fake.request_count("item/1"), 2);
+    assert_eq!(fake.request_count("item/2"), 2);
+    assert_eq!(fake.request_count("item/3"), 1);
+    assert_eq!(fake.request_count("item/4"), 1);
+    assert_eq!(fake.request_count("item/5"), 1);
+    assert_eq!(fake.request_count("item/6"), 2);
+    assert_eq!(fake.request_count("item/7"), 3);
+    let retry_times = fake.request_times("item/2");
+    assert!(retry_times[1].duration_since(retry_times[0]) >= Duration::from_millis(20));
+    assert!(retry_times[1].duration_since(retry_times[0]) < Duration::from_millis(200));
+
+    fake.stop().await
+}
+
+#[tokio::test]
+async fn cache_uses_five_minute_freshness_class_for_comments_and_poll_options() -> TestResult {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "item/10".to_owned(),
+        vec![FakeReply::json(
+            r#"{"id":10,"type":"story","title":"Story metadata"}"#,
+        )],
+    );
+    routes.insert(
+        "item/11".to_owned(),
+        vec![FakeReply::json(r#"{"id":11,"type":"comment"}"#)],
+    );
+    routes.insert(
+        "item/12".to_owned(),
+        vec![FakeReply::json(r#"{"id":12,"type":"pollopt"}"#)],
+    );
+    let fake = FakeHackerNews::start(routes).await?;
+    let mut options = fast_hacker_news_options();
+    options.item_fresh_for = Duration::from_millis(20);
+    options.comment_fresh_for = Duration::from_millis(100);
+    options.poll_option_fresh_for = Duration::from_millis(100);
+    let content = HackerNewsContent::for_endpoint_with_options(fake.endpoint(), options);
+
+    content.feed_entry(10).await?;
+    content.feed_entry(11).await?;
+    content.feed_entry(12).await?;
+    sleep(Duration::from_millis(30)).await;
+    assert!(content.feed_entry(10).await?.freshness.is_stale());
+    assert!(content.feed_entry(11).await?.freshness.is_fresh());
+    assert!(content.feed_entry(12).await?.freshness.is_fresh());
+    sleep(Duration::from_millis(80)).await;
+    assert!(content.feed_entry(11).await?.freshness.is_stale());
+    assert!(content.feed_entry(12).await?.freshness.is_stale());
+    assert_eq!(fake.request_count("item/10"), 1);
+    assert_eq!(fake.request_count("item/11"), 1);
+    assert_eq!(fake.request_count("item/12"), 1);
+
+    fake.stop().await
+}
+
+#[tokio::test]
+async fn upstream_requests_share_one_global_sixteen_request_limit() -> TestResult {
+    let mut routes = HashMap::new();
+    for id in 1..=40 {
+        routes.insert(
+            format!("item/{id}"),
+            vec![
+                FakeReply::json(format!(
+                    r#"{{"id":{id},"type":"story","title":"Concurrent {id}"}}"#
+                ))
+                .delayed(Duration::from_millis(30)),
+            ],
+        );
+    }
+    let fake = FakeHackerNews::start(routes).await?;
+    let content = Arc::new(HackerNewsContent::for_endpoint_with_options(
+        fake.endpoint(),
+        fast_hacker_news_options(),
+    ));
+    let mut requests = tokio::task::JoinSet::new();
+    for id in 1..=40 {
+        let content = Arc::clone(&content);
+        requests.spawn(async move { content.feed_entry(id).await });
+    }
+    while let Some(result) = requests.join_next().await {
+        result??;
+    }
+
+    assert!(fake.maximum_active_items() <= 16);
+    assert!(fake.maximum_active_items() > 8);
+    fake.stop().await
+}
+
+#[tokio::test]
+async fn cache_observes_fresh_stale_and_lru_resource_bounds() -> TestResult {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "topstories".to_owned(),
+        vec![
+            FakeReply::json("[1]"),
+            FakeReply::status(StatusCode::NOT_FOUND),
+            FakeReply::json("[2]"),
+        ],
+    );
+    for id in 1..=3 {
+        routes.insert(
+            format!("item/{id}"),
+            vec![FakeReply::json(format!(
+                r#"{{"id":{id},"type":"story","title":"Cache entry {id}"}}"#
+            ))],
+        );
+    }
+    let fake = FakeHackerNews::start(routes).await?;
+    let mut options = fast_hacker_news_options();
+    options.top_feed_fresh_for = Duration::from_millis(20);
+    options.top_feed_stale_for = Duration::from_millis(90);
+    options.revalidation_interval = Duration::ZERO;
+    options.maximum_cache_entries = 2;
+    let content = HackerNewsContent::for_endpoint_with_options(fake.endpoint(), options);
+
+    assert!(content.top_feed().await?.freshness.is_fresh());
+    assert!(content.top_feed().await?.freshness.is_fresh());
+    assert_eq!(fake.request_count("topstories"), 1);
+    sleep(Duration::from_millis(30)).await;
+    assert!(content.top_feed().await?.freshness.is_stale());
+    assert!(content.refresh_top_feed().await?.freshness.is_stale());
+    assert_eq!(fake.request_count("topstories"), 2);
+    sleep(Duration::from_millis(80)).await;
+    assert_eq!(content.top_feed().await?.value, vec![2]);
+    assert_eq!(fake.request_count("topstories"), 3);
+
+    content.feed_entry(1).await?;
+    content.feed_entry(2).await?;
+    content.feed_entry(1).await?;
+    content.feed_entry(3).await?;
+    content.feed_entry(2).await?;
+    assert_eq!(
+        fake.request_count("item/2"),
+        2,
+        "the least-recently-used inactive record is evicted at the entry cap"
+    );
+
+    fake.stop().await
+}
+
+#[tokio::test]
+async fn item_stale_fallback_stops_at_the_configured_limit() -> TestResult {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "item/1".to_owned(),
+        vec![
+            FakeReply::json(r#"{"id":1,"type":"story","title":"Bounded stale item"}"#),
+            FakeReply::status(StatusCode::NOT_FOUND),
+            FakeReply::status(StatusCode::NOT_FOUND),
+        ],
+    );
+    let fake = FakeHackerNews::start(routes).await?;
+    let mut options = fast_hacker_news_options();
+    options.item_fresh_for = Duration::from_millis(20);
+    options.item_stale_for = Duration::from_millis(80);
+    options.revalidation_interval = Duration::ZERO;
+    let content = HackerNewsContent::for_endpoint_with_options(fake.endpoint(), options);
+
+    content.feed_entry(1).await?;
+    sleep(Duration::from_millis(30)).await;
+    assert!(content.feed_entry(1).await?.freshness.is_stale());
+    assert!(content.refresh_feed_entry(1).await?.freshness.is_stale());
+    sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        content.refresh_feed_entry(1).await,
+        Err(ContentError::Unavailable),
+        "expired item content must not survive a failed refresh"
+    );
+    assert_eq!(fake.request_count("item/1"), 3);
+
+    fake.stop().await
+}
+
+#[tokio::test]
+async fn cache_weight_cap_evicts_large_inactive_records() -> TestResult {
+    let large_title = "x".repeat(500);
+    let mut routes = HashMap::new();
+    for id in 1..=2 {
+        routes.insert(
+            format!("item/{id}"),
+            vec![FakeReply::json(format!(
+                r#"{{"id":{id},"type":"story","title":"{large_title}"}}"#
+            ))],
+        );
+    }
+    let fake = FakeHackerNews::start(routes).await?;
+    let mut options = fast_hacker_news_options();
+    options.maximum_cache_entries = 10;
+    options.maximum_cache_weight = 700;
+    let content = HackerNewsContent::for_endpoint_with_options(fake.endpoint(), options);
+
+    content.feed_entry(1).await?;
+    content.feed_entry(2).await?;
+    content.feed_entry(1).await?;
+    assert_eq!(
+        fake.request_count("item/1"),
+        2,
+        "the content-weight cap evicts an inactive large record"
+    );
+
     fake.stop().await
 }
 
