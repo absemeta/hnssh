@@ -1,7 +1,7 @@
 # HNSSH
 
 HNSSH is an anonymously accessible, full-screen Hacker News browser served over SSH.
-The current runnable slice progressively pages through Hacker News's official top feed, with shared bounded caching, refresh, stale fallback, local failure states, safely rendered rich details, validated links, poll options, and lazy bounded comment threads.
+The current runnable slice progressively pages through Hacker News's official top feed, with shared bounded caching, refresh, stale fallback, local failure states, safely rendered rich Entry views, portable validated links, poll options, and readable progressively materialized Comment threads.
 
 ## Run locally
 
@@ -25,7 +25,9 @@ Then connect without a visitor password or key:
 ssh -p 2222 localhost
 ```
 
-Use the arrow keys or `j`/`k` to move, Enter to inspect an entry or activate its selected detail action, Escape or Backspace to return, `r` to refresh or retry the feed, `?` for help, and `q` to quit. Comment threads load siblings in batches of 20; use Left to collapse or move to a parent, Right to expand, and Space to toggle a subtree. `HNSSH_LISTEN_ADDRESS` and `HNSSH_HOST_KEY` provide equivalent environment configuration.
+Use the arrow keys or `j`/`k` to move and Enter to open a Feed entry directly. An Entry view combines compact entry context, available story text or poll options, and its Comment thread; Page Up/Page Down traverses rendered content. Press `o` to expose the entry's primary validated external destination as portable terminal text and `l` for the contextual validated-link list. Escape or Backspace returns, `r` refreshes or retries the feed or selected comment, `?` opens help, and `q` quits.
+
+Comment subtrees are expanded by default while descendants materialize progressively near the viewport in sibling batches of 20. Use `n`/`p` for next/previous sibling, `P` for parent, and `N` for first child; available structural actions appear on the selected comment header. Left collapses or moves to a parent, Right expands, Space toggles one subtree, and `C`/`E` collapses/expands the whole thread. Collapsed comments retain a compact author row while hiding their text and metadata. `HNSSH_LISTEN_ADDRESS` and `HNSSH_HOST_KEY` provide equivalent environment configuration.
 
 The SSH client's first-connection host-authenticity prompt verifies the server and is distinct from visitor authentication. Keep the host key stable: HNSSH deliberately fails startup instead of generating or replacing a missing key.
 

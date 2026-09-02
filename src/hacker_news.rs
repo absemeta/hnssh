@@ -454,6 +454,12 @@ impl UpstreamItem {
         let mut details = EntryDetails {
             id: requested_id,
             source,
+            primary_link: valid_url.map(|url| {
+                Link::new(
+                    title.clone().unwrap_or_else(|| url.destination.clone()),
+                    url.destination,
+                )
+            }),
             links,
             title: title.clone(),
             score: self.score,
@@ -715,6 +721,11 @@ fn feed_entry_weight(entry: &FeedEntry) -> usize {
             weight = weight.saturating_add(rich_text_weight(text));
         }
         weight = weight.saturating_add(details.comment_ids.len().saturating_mul(8));
+        if let Some(link) = &details.primary_link {
+            weight = weight
+                .saturating_add(link.label.len())
+                .saturating_add(link.destination.len());
+        }
         for link in &details.links {
             weight = weight
                 .saturating_add(link.label.len())

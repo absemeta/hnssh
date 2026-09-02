@@ -1,8 +1,8 @@
-# 12 — Deploy, drain, and roll back safely
+# 13 — Deploy, drain, and roll back safely
 
 **What to build:** An operator can activate or roll back an immutable HNSSH release while retaining host identity, giving connected visitors a bounded graceful close, and restoring service health predictably.
 
-**Blocked by:** 09 — Protect established browsing sessions from overload; 11 — Run HNSSH on public port 22 with stable host identity.
+**Blocked by:** 10 — Protect established browsing sessions from overload; 12 — Run HNSSH on public port 22 with stable host identity.
 
 **Status:** ready-for-agent
 

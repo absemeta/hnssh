@@ -27,11 +27,13 @@ An implementation-ready MVP specification and sequenced Rust learning path for a
 
 ## Decisions so far
 
+- [Expanded Comment threads use the Tree-rails prototype treatment, compact author-only collapsed rows, and available structural-key helpers.](../comments/WF-015/2026-08-23-resolution.md)
+- [Feed entries open a direct combined Entry view with portable link actions, progressive expanded comments, structural navigation, and identity-anchored restoration.](../comments/WF-016/2026-08-23-resolution.md)
+
 ## Not yet specified
 
 - The exact feasibility experiment or benchmark needed to validate 200 concurrent sessions; its useful shape depends on the selected SSH stack, application architecture, and resource model.
 - Stack-specific hardening and operational questions that may surface only after the SSH and deployment topology decisions.
-- Terminal interaction gaps or follow-up questions exposed by the fixture prototype; these cannot be named until there is something concrete to test.
 
 ## Out of scope
 

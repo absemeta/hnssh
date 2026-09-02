@@ -238,10 +238,6 @@ impl TerminalSize {
     fn area(self) -> Rect {
         Rect::new(0, 0, self.columns, self.rows)
     }
-
-    fn page_len(self) -> usize {
-        ui::page_len(self.rows)
-    }
 }
 
 fn clamp_dimension(value: u32, previous: u16, maximum: u16) -> u16 {
@@ -334,7 +330,7 @@ impl SessionActor {
         mut events: UnboundedReceiver<ActorEvent>,
         event_sender: UnboundedSender<ActorEvent>,
     ) -> Result<(), ActorError> {
-        self.render().await?;
+        self.redraw(&event_sender).await?;
         self.load_top_feed(event_sender.clone(), ContentUpdate::Initial);
 
         while let Some(event) = events.recv().await {
@@ -344,13 +340,13 @@ impl SessionActor {
                     let loaded = result.is_ok();
                     self.browser
                         .set_top_feed(result, TOP_FEED_PAGE_SIZE, update);
-                    self.render().await?;
+                    self.redraw(&event_sender).await?;
                     if loaded {
                         self.load_entries(self.browser.loaded_entries(), &event_sender, update);
                     }
                     if revalidate {
                         self.browser.begin_top_feed_revalidation();
-                        self.render().await?;
+                        self.redraw(&event_sender).await?;
                         self.load_top_feed(event_sender.clone(), ContentUpdate::Revalidation);
                     }
                 }
@@ -365,7 +361,7 @@ impl SessionActor {
                     if revalidate {
                         self.browser.begin_entry_revalidation();
                     }
-                    self.render().await?;
+                    self.redraw(&event_sender).await?;
                     if revalidate {
                         self.load_entry(
                             FeedEntryLoad { index, id },
@@ -383,7 +379,7 @@ impl SessionActor {
                         },
                     );
                     self.browser.set_comment(load, result);
-                    self.render().await?;
+                    self.redraw(&event_sender).await?;
                     if revalidate {
                         self.load_comment(
                             CommentLoad {
@@ -395,25 +391,20 @@ impl SessionActor {
                     }
                 }
                 ActorEvent::Input(key) => {
-                    let detail_scroll_max = ui::detail_scroll_max(&self.browser, self.size.area());
-                    match self
-                        .browser
-                        .handle_key(key, self.size.page_len(), detail_scroll_max)
-                    {
-                        CommandOutcome::Redraw => self.render().await?,
+                    let page_len =
+                        ui::navigation_page_len(self.browser.view_kind(), self.size.rows);
+                    match self.browser.handle_key(key, page_len) {
+                        CommandOutcome::Redraw | CommandOutcome::LoadComments => {
+                            self.redraw(&event_sender).await?
+                        }
                         CommandOutcome::RefreshTopFeed => {
-                            self.render().await?;
+                            self.redraw(&event_sender).await?;
                             self.load_top_feed(event_sender.clone(), ContentUpdate::Revalidation);
                         }
                         CommandOutcome::LoadNextPage => {
                             let entries = self.browser.load_next_page(TOP_FEED_PAGE_SIZE);
-                            self.render().await?;
+                            self.redraw(&event_sender).await?;
                             self.load_entries(entries, &event_sender, ContentUpdate::Initial);
-                        }
-                        CommandOutcome::LoadComments => {
-                            let loads = self.browser.take_comment_loads();
-                            self.render().await?;
-                            self.load_comments(loads, &event_sender);
                         }
                         CommandOutcome::Unchanged => {}
                         CommandOutcome::Quit => {
@@ -424,8 +415,9 @@ impl SessionActor {
                 }
                 ActorEvent::Resize(size) => {
                     self.size = size;
+                    self.browser.request_entry_reveal();
                     self.terminal.resize(size.area())?;
-                    self.render().await?;
+                    self.redraw(&event_sender).await?;
                 }
                 ActorEvent::Stop => return Ok(()),
             }
@@ -521,11 +513,24 @@ impl SessionActor {
         });
     }
 
-    async fn render(&mut self) -> Result<(), ActorError> {
-        let browser = &self.browser;
+    async fn redraw(
+        &mut self,
+        event_sender: &UnboundedSender<ActorEvent>,
+    ) -> Result<(), ActorError> {
+        let candidates = self.render().await?;
+        let mut loads = self.browser.take_comment_loads();
+        loads.extend(self.browser.materialize_current_comments(&candidates));
+        self.load_comments(loads, event_sender);
+        Ok(())
+    }
+
+    async fn render(&mut self) -> Result<Vec<usize>, ActorError> {
+        let browser = &mut self.browser;
         let size = self.size.area();
-        self.terminal
-            .draw(|frame| ui::render(frame, browser, size))?;
+        let mut candidates = Vec::new();
+        self.terminal.draw(|frame| {
+            candidates = ui::render(frame, browser, size);
+        })?;
         let output = self.output.take()?;
         if !output.is_empty() {
             self.handle
@@ -533,7 +538,7 @@ impl SessionActor {
                 .await
                 .map_err(|_| ActorError::OutputClosed)?;
         }
-        Ok(())
+        Ok(candidates)
     }
 
     async fn finish(&mut self) {

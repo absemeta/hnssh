@@ -1,8 +1,8 @@
-# 11 — Run HNSSH on public port 22 with stable host identity
+# 12 — Run HNSSH on public port 22 with stable host identity
 
 **What to build:** An operator can run HNSSH on a single Linux VPS at public TCP port 22 as a hardened non-root process with a stable application host key and a separately verified administrative route.
 
-**Blocked by:** 08 — Harden the SSH and terminal lifecycle; 10 — Expose privacy-preserving operational health.
+**Blocked by:** 09 — Harden the SSH and terminal lifecycle; 11 — Expose privacy-preserving operational health.
 
 **Status:** ready-for-agent
 

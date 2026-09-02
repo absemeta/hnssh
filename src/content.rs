@@ -225,6 +225,7 @@ pub struct EntryDetails {
     pub comment_count: Option<u32>,
     pub comment_ids: Vec<CommentId>,
     pub text: Option<RichText>,
+    pub primary_link: Option<Link>,
     pub links: Vec<Link>,
     pub omitted_link_count: usize,
 }
@@ -373,6 +374,11 @@ impl FeedEntry {
         }
     }
 
+    pub fn primary_link(&self) -> Option<&Link> {
+        self.details()
+            .and_then(|details| details.primary_link.as_ref())
+    }
+
     pub fn links(&self) -> &[Link] {
         self.details()
             .map_or(&[], |details| details.links.as_slice())
@@ -436,6 +442,10 @@ impl FixtureContent {
                 comment_count: None,
                 comment_ids: Vec::new(),
                 text: Some(RichText::plain("Build calm tools for noisy systems.")),
+                primary_link: Some(Link::new(
+                    "Acme careers",
+                    "https://jobs.example.com/terminal-engineer",
+                )),
                 links: vec![Link::new(
                     "Acme careers",
                     "https://jobs.example.com/terminal-engineer",
@@ -453,6 +463,7 @@ impl FixtureContent {
                     comment_count: Some(39),
                     comment_ids: Vec::new(),
                     text: None,
+                    primary_link: None,
                     links: Vec::new(),
                     omitted_link_count: 0,
                 },
@@ -637,6 +648,7 @@ fn story(
         comment_count: Some(metadata.comment_count),
         comment_ids: Vec::new(),
         text: text.map(RichText::plain),
+        primary_link: metadata.source.and_then(|_| links.first().cloned()),
         links,
         omitted_link_count: 0,
     })

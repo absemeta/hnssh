@@ -1,8 +1,8 @@
-# 10 — Expose privacy-preserving operational health
+# 11 — Expose privacy-preserving operational health
 
 **What to build:** An operator can determine whether HNSSH is alive, ready, overloaded, or degraded and estimate daily reach without collecting source-address history, usernames, content-level activity, or visitor navigation profiles.
 
-**Blocked by:** 04 — Refresh and page through a resilient top feed; 09 — Protect established browsing sessions from overload.
+**Blocked by:** 04 — Refresh and page through a resilient top feed; 10 — Protect established browsing sessions from overload.
 
 **Status:** ready-for-agent
 

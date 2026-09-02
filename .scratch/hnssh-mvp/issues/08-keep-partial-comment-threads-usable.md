@@ -1,8 +1,8 @@
-# 07 — Keep partial and malformed comment threads usable
+# 08 — Keep partial and malformed comment threads usable
 
 **What to build:** A visitor can continue reading a comment thread when individual comments are deleted, dead, missing, stale, failed, duplicated, cyclic, or beyond safe materialization limits.
 
-**Blocked by:** 06 — Browse comment threads progressively.
+**Blocked by:** 07 — Make entry links and comment threads direct, navigable, and readable.
 
 **Status:** ready-for-agent
 

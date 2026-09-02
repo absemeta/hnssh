@@ -1,8 +1,8 @@
-# 09 — Protect established browsing sessions from overload
+# 10 — Protect established browsing sessions from overload
 
 **What to build:** Existing visitors remain usable when anonymous connection demand exceeds capacity, while excess arrivals, abusive sources, idle sessions, and overlong sessions receive bounded and understandable outcomes.
 
-**Blocked by:** 08 — Harden the SSH and terminal lifecycle.
+**Blocked by:** 09 — Harden the SSH and terminal lifecycle.
 
 **Status:** ready-for-agent
 

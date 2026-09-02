@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::content::{Comment, CommentId, ContentError, ContentSnapshot, FeedEntryId};
+use crate::content::{Comment, CommentId, ContentError, ContentSnapshot, FeedEntryId, Link};
 use crate::input::Key;
 
 pub(crate) const COMMENT_BATCH_SIZE: usize = 20;
@@ -43,6 +43,10 @@ pub(crate) struct ThreadNode {
 impl ThreadNode {
     pub(crate) fn id(&self) -> CommentId {
         self.id
+    }
+
+    pub(crate) fn parent(&self) -> Option<usize> {
+        self.parent
     }
 
     pub(crate) fn state(&self) -> &ThreadNodeState {
@@ -127,16 +131,30 @@ pub(crate) enum ThreadRow {
     Comment {
         node: usize,
         depth: usize,
+        guides: Vec<bool>,
+        is_last: bool,
     },
     LoadMore {
         owner: GroupOwner,
         depth: usize,
         remaining: usize,
+        guides: Vec<bool>,
+        is_last: bool,
     },
     Marker {
         depth: usize,
         label: String,
+        guides: Vec<bool>,
+        is_last: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StructuralActions {
+    pub(crate) parent: bool,
+    pub(crate) next: bool,
+    pub(crate) previous: bool,
+    pub(crate) child: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -146,8 +164,10 @@ pub(crate) struct CommentThread {
     roots: SiblingGroup,
     nodes: Vec<ThreadNode>,
     seen: HashSet<CommentId>,
-    selected: usize,
-    offset: usize,
+    selected_node: Option<usize>,
+    selected_row: usize,
+    selection_engaged: bool,
+    reveal_selection: bool,
 }
 
 impl CommentThread {
@@ -162,10 +182,13 @@ impl CommentThread {
             roots: SiblingGroup::new(root_ids),
             nodes: Vec::new(),
             seen: HashSet::new(),
-            selected: 0,
-            offset: 0,
+            selected_node: None,
+            selected_row: 0,
+            selection_engaged: false,
+            reveal_selection: false,
         };
         let loads = thread.load_group(GroupOwner::Root);
+        thread.selected_node = loads.first().map(|load| load.node);
         (thread, loads)
     }
 
@@ -173,70 +196,121 @@ impl CommentThread {
         self.generation
     }
 
-    pub(crate) fn position(&self) -> (usize, usize) {
-        (self.selected, self.offset)
+    pub(crate) fn position(&self) -> usize {
+        self.selected_position(&self.rows())
+    }
+
+    pub(crate) fn selected_node(&self) -> Option<usize> {
+        self.selected_node
     }
 
     pub(crate) fn node(&self, index: usize) -> Option<&ThreadNode> {
         self.nodes.get(index)
     }
 
-    pub(crate) fn rows(&self) -> Vec<ThreadRow> {
-        #[derive(Clone)]
-        enum Pending {
-            Edge(ThreadEdge, usize),
-            LoadMore(GroupOwner, usize, usize),
-        }
+    pub(crate) fn selected_comment_id(&self) -> Option<CommentId> {
+        self.selected_node
+            .and_then(|node| self.nodes.get(node))
+            .map(ThreadNode::id)
+    }
 
+    pub(crate) fn selected_links(&self) -> Option<&[Link]> {
+        let node = self.nodes.get(self.selected_node?)?;
+        match &node.state {
+            ThreadNodeState::Ready(snapshot) => match &snapshot.value {
+                Comment::Available(details) => Some(&details.links),
+                Comment::Deleted { .. }
+                | Comment::Dead { .. }
+                | Comment::Missing { .. }
+                | Comment::Unsupported { .. } => Some(&[]),
+            },
+            ThreadNodeState::Loading
+            | ThreadNodeState::Unavailable
+            | ThreadNodeState::Retryable => Some(&[]),
+        }
+    }
+
+    pub(crate) fn structural_actions(&self, node: usize) -> StructuralActions {
+        let Some(comment) = self.nodes.get(node) else {
+            return StructuralActions::default();
+        };
+        let owner = comment.parent.map_or(GroupOwner::Root, GroupOwner::Node);
+        let siblings = self.sibling_nodes(owner);
+        let position = siblings.iter().position(|&sibling| sibling == node);
+        StructuralActions {
+            parent: comment.parent.is_some(),
+            next: position.is_some_and(|position| position + 1 < siblings.len())
+                || self.group(owner).remaining() > 0,
+            previous: position.is_some_and(|position| position > 0),
+            child: comment.has_children(),
+        }
+    }
+
+    pub(crate) fn rows(&self) -> Vec<ThreadRow> {
         fn push_group(
-            pending: &mut Vec<Pending>,
+            rows: &mut Vec<ThreadRow>,
+            nodes: &[ThreadNode],
             group: &SiblingGroup,
             owner: GroupOwner,
             depth: usize,
+            guides: &[bool],
         ) {
-            if group.remaining() > 0 {
-                pending.push(Pending::LoadMore(owner, depth, group.remaining()));
+            let has_load_more = group.remaining() > 0;
+            let visible_count = group.edges.len() + usize::from(has_load_more);
+            for (position, edge) in group.edges.iter().enumerate() {
+                let is_last = position + 1 == visible_count;
+                match edge {
+                    ThreadEdge::Node(node) => {
+                        rows.push(ThreadRow::Comment {
+                            node: *node,
+                            depth,
+                            guides: guides.to_vec(),
+                            is_last,
+                        });
+                        if let Some(comment) = nodes.get(*node)
+                            && comment.expanded
+                            && let Some(children) = &comment.children
+                        {
+                            let mut child_guides = guides.to_vec();
+                            child_guides.push(!is_last);
+                            push_group(
+                                rows,
+                                nodes,
+                                children,
+                                GroupOwner::Node(*node),
+                                depth.saturating_add(1),
+                                &child_guides,
+                            );
+                        }
+                    }
+                    ThreadEdge::Marker(marker) => rows.push(ThreadRow::Marker {
+                        depth,
+                        label: marker.label(),
+                        guides: guides.to_vec(),
+                        is_last,
+                    }),
+                }
             }
-            pending.extend(
-                group
-                    .edges
-                    .iter()
-                    .rev()
-                    .cloned()
-                    .map(|edge| Pending::Edge(edge, depth)),
-            );
+            if has_load_more {
+                rows.push(ThreadRow::LoadMore {
+                    owner,
+                    depth,
+                    remaining: group.remaining(),
+                    guides: guides.to_vec(),
+                    is_last: true,
+                });
+            }
         }
 
         let mut rows = Vec::new();
-        let mut pending = Vec::new();
-        push_group(&mut pending, &self.roots, GroupOwner::Root, 0);
-        while let Some(item) = pending.pop() {
-            match item {
-                Pending::Edge(ThreadEdge::Node(node), depth) => {
-                    rows.push(ThreadRow::Comment { node, depth });
-                    if let Some(comment) = self.nodes.get(node)
-                        && comment.expanded
-                        && let Some(children) = &comment.children
-                    {
-                        push_group(
-                            &mut pending,
-                            children,
-                            GroupOwner::Node(node),
-                            depth.saturating_add(1),
-                        );
-                    }
-                }
-                Pending::Edge(ThreadEdge::Marker(marker), depth) => rows.push(ThreadRow::Marker {
-                    depth,
-                    label: marker.label(),
-                }),
-                Pending::LoadMore(owner, depth, remaining) => rows.push(ThreadRow::LoadMore {
-                    owner,
-                    depth,
-                    remaining,
-                }),
-            }
-        }
+        push_group(
+            &mut rows,
+            &self.nodes,
+            &self.roots,
+            GroupOwner::Root,
+            0,
+            &[],
+        );
         rows
     }
 
@@ -272,132 +346,286 @@ impl CommentThread {
                 unreachable!("the preserve guard requires a ready comment")
             };
             snapshot.mark_stale();
-            return;
+        } else {
+            node.state = match result {
+                Ok(snapshot) if snapshot.value.id() == load.id => {
+                    ThreadNodeState::Ready(Box::new(snapshot))
+                }
+                Err(ContentError::Retryable) => ThreadNodeState::Retryable,
+                Ok(_) | Err(ContentError::Unavailable) => ThreadNodeState::Unavailable,
+            };
         }
-
-        node.state = match result {
-            Ok(snapshot) if snapshot.value.id() == load.id => {
-                ThreadNodeState::Ready(Box::new(snapshot))
-            }
-            Err(ContentError::Retryable) => ThreadNodeState::Retryable,
-            Ok(_) | Err(ContentError::Unavailable) => ThreadNodeState::Unavailable,
-        };
+        if self.selection_engaged {
+            self.reveal_selection = true;
+        }
     }
 
-    pub(crate) fn handle_key(&mut self, key: Key, page_len: usize) -> (bool, Vec<CommentLoad>) {
-        let rows = self.rows();
-        let last = rows.len().saturating_sub(1);
-        let previous = (self.selected, self.offset);
-        self.selected = self.selected.min(last);
+    pub(crate) fn materialize_near(&mut self, nodes: &[usize]) -> Vec<CommentLoad> {
+        let mut loads = Vec::new();
+        let mut unique = HashSet::new();
+        for &node in nodes {
+            if unique.insert(node) && self.nodes.get(node).is_some_and(ThreadNode::expanded) {
+                loads.extend(self.ensure_children(node));
+            }
+        }
+        loads
+    }
 
-        let mut structural_changed = false;
+    pub(crate) fn request_reveal(&mut self) {
+        if self.selected_node.is_some() {
+            self.reveal_selection = true;
+        }
+    }
+
+    pub(crate) fn take_reveal_request(&mut self) -> bool {
+        std::mem::take(&mut self.reveal_selection)
+    }
+
+    pub(crate) fn handle_key(&mut self, key: Key) -> (bool, Vec<CommentLoad>) {
+        let rows = self.rows();
+        let previous_node = self.selected_node;
+        let previous_row = self.selected_position(&rows);
+        let mut loads = Vec::new();
+        let mut changed = false;
+
         match key {
-            Key::Up => self.selected = self.selected.saturating_sub(1),
-            Key::Down => self.selected = self.selected.saturating_add(1).min(last),
-            Key::PageUp => self.selected = self.selected.saturating_sub(page_len),
-            Key::PageDown => self.selected = self.selected.saturating_add(page_len).min(last),
-            Key::First => self.selected = 0,
-            Key::Last => self.selected = last,
+            Key::Up => changed = self.move_linear(&rows, -1),
+            Key::Down => changed = self.move_linear(&rows, 1),
             Key::Left => {
-                if let Some(ThreadRow::Comment { node, .. }) = rows.get(self.selected) {
-                    if self.nodes[*node].expanded {
-                        self.nodes[*node].expanded = false;
-                        structural_changed = true;
-                    } else if let Some(parent) = self.nodes[*node].parent
-                        && let Some(position) = rows.iter().position(
-                            |row| matches!(row, ThreadRow::Comment { node, .. } if *node == parent),
-                        )
-                    {
-                        self.selected = position;
-                    }
+                let Some(node) = self.selected_node else {
+                    return (false, loads);
+                };
+                if self.nodes[node].expanded {
+                    self.nodes[node].expanded = false;
+                    changed = true;
+                } else if let Some(parent) = self.nodes[node].parent {
+                    self.select_node(parent);
+                    changed = true;
                 }
             }
             Key::Right => {
-                let before = self.selected_node_signature(&rows);
-                let loads = self.expand_selected(&rows);
-                let changed = before != self.selected_node_signature(&rows);
-                self.keep_visible(page_len);
-                return (
-                    changed || !loads.is_empty() || previous != (self.selected, self.offset),
-                    loads,
-                );
+                let Some(node) = self.selected_node else {
+                    return (false, loads);
+                };
+                changed = !self.nodes[node].expanded;
+                loads.extend(self.expand_node(node));
             }
-            Key::Enter | Key::Toggle => {
-                let loads = self.activate_selected(&rows);
-                self.keep_visible(page_len);
-                return (true, loads);
-            }
-            Key::Refresh => {
-                let loads = self.refresh_selected(&rows);
-                return (!loads.is_empty(), loads);
-            }
-            _ => return (false, Vec::new()),
-        }
-
-        self.keep_visible(page_len);
-        (
-            structural_changed || previous != (self.selected, self.offset),
-            Vec::new(),
-        )
-    }
-
-    fn selected_node_signature(&self, rows: &[ThreadRow]) -> Option<(bool, bool)> {
-        let ThreadRow::Comment { node, .. } = rows.get(self.selected)? else {
-            return None;
-        };
-        Some((
-            self.nodes[*node].expanded,
-            matches!(self.nodes[*node].state, ThreadNodeState::Retryable),
-        ))
-    }
-
-    fn activate_selected(&mut self, rows: &[ThreadRow]) -> Vec<CommentLoad> {
-        match rows.get(self.selected) {
-            Some(ThreadRow::Comment { node, .. }) => {
-                let node = *node;
-                if matches!(self.nodes[node].state, ThreadNodeState::Retryable) {
-                    self.nodes[node].state = ThreadNodeState::Loading;
-                    return vec![self.comment_load(node, CommentUpdate::Initial)];
-                }
+            Key::Toggle => {
+                let Some(node) = self.selected_node else {
+                    return (false, loads);
+                };
                 if self.nodes[node].expanded {
                     self.nodes[node].expanded = false;
-                    Vec::new()
+                    changed = true;
                 } else {
-                    self.expand_node(node)
+                    loads.extend(self.expand_node(node));
+                    changed = true;
                 }
             }
-            Some(ThreadRow::LoadMore { owner, .. }) => self.load_group(*owner),
-            Some(ThreadRow::Marker { .. }) | None => Vec::new(),
+            Key::CollapseAll => {
+                for node in &mut self.nodes {
+                    node.expanded = false;
+                }
+                if let Some(mut selected) = self.selected_node {
+                    while let Some(parent) = self.nodes[selected].parent {
+                        selected = parent;
+                    }
+                    self.select_node(selected);
+                }
+                changed = true;
+            }
+            Key::ExpandAll => {
+                for node in &mut self.nodes {
+                    node.expanded = true;
+                }
+                changed = true;
+            }
+            Key::NextSibling => {
+                let Some(node) = self.selected_node else {
+                    return (false, loads);
+                };
+                let (next, new_loads) = self.next_sibling(node);
+                loads.extend(new_loads);
+                if let Some(next) = next {
+                    self.select_node(next);
+                    changed = true;
+                }
+            }
+            Key::PreviousSibling => {
+                if let Some(previous) = self
+                    .selected_node
+                    .and_then(|node| self.previous_sibling(node))
+                {
+                    self.select_node(previous);
+                    changed = true;
+                }
+            }
+            Key::Parent => {
+                if let Some(parent) = self
+                    .selected_node
+                    .and_then(|node| self.nodes.get(node))
+                    .and_then(ThreadNode::parent)
+                {
+                    self.select_node(parent);
+                    changed = true;
+                }
+            }
+            Key::FirstChild => {
+                let Some(node) = self.selected_node else {
+                    return (false, loads);
+                };
+                loads.extend(self.expand_node(node));
+                if let Some(child) = self.first_child(node) {
+                    self.select_node(child);
+                    changed = true;
+                }
+            }
+            Key::Enter => {
+                let selected = self.selected_position(&rows);
+                match rows.get(selected) {
+                    Some(ThreadRow::Comment { node, .. })
+                        if matches!(self.nodes[*node].state, ThreadNodeState::Retryable) =>
+                    {
+                        self.nodes[*node].state = ThreadNodeState::Loading;
+                        loads.push(self.comment_load(*node, CommentUpdate::Initial));
+                        changed = true;
+                    }
+                    Some(ThreadRow::LoadMore { owner, .. }) => {
+                        loads.extend(self.load_group(*owner));
+                        changed = true;
+                    }
+                    Some(ThreadRow::Comment { .. }) | Some(ThreadRow::Marker { .. }) | None => {}
+                }
+            }
+            Key::Refresh => {
+                let Some(node) = self.selected_node else {
+                    return (false, loads);
+                };
+                if !self.nodes[node].refreshing
+                    && !matches!(self.nodes[node].state, ThreadNodeState::Loading)
+                {
+                    self.nodes[node].refreshing = true;
+                    loads.push(self.comment_load(node, CommentUpdate::Revalidation));
+                    changed = true;
+                }
+            }
+            _ => return (false, loads),
+        }
+
+        if changed || previous_node != self.selected_node || previous_row != self.position() {
+            self.selection_engaged = true;
+            self.reveal_selection = true;
+        }
+        (changed || !loads.is_empty(), loads)
+    }
+
+    fn move_linear(&mut self, rows: &[ThreadRow], direction: isize) -> bool {
+        if rows.is_empty() {
+            return false;
+        }
+        let current = self.selected_position(rows);
+        let next = if direction > 0 {
+            current.saturating_add(1).min(rows.len().saturating_sub(1))
+        } else {
+            current.saturating_sub(1)
+        };
+        if next == current {
+            return false;
+        }
+        self.set_selection_from_row(next, rows);
+        true
+    }
+
+    fn select_node(&mut self, node: usize) {
+        self.selected_node = Some(node);
+        self.selection_engaged = true;
+        self.reveal_selection = true;
+    }
+
+    fn set_selection_from_row(&mut self, position: usize, rows: &[ThreadRow]) {
+        self.selected_row = position;
+        self.selected_node = match rows.get(position) {
+            Some(ThreadRow::Comment { node, .. }) => Some(*node),
+            Some(ThreadRow::LoadMore { .. }) | Some(ThreadRow::Marker { .. }) | None => None,
+        };
+    }
+
+    fn selected_position(&self, rows: &[ThreadRow]) -> usize {
+        self.selected_node
+            .and_then(|selected| {
+                rows.iter().position(
+                    |row| matches!(row, ThreadRow::Comment { node, .. } if *node == selected),
+                )
+            })
+            .unwrap_or(self.selected_row)
+            .min(rows.len().saturating_sub(1))
+    }
+
+    fn next_sibling(&mut self, node: usize) -> (Option<usize>, Vec<CommentLoad>) {
+        let owner = self.nodes[node]
+            .parent
+            .map_or(GroupOwner::Root, GroupOwner::Node);
+        let mut loads = Vec::new();
+        loop {
+            let siblings = self.sibling_nodes(owner);
+            let Some(position) = siblings.iter().position(|&sibling| sibling == node) else {
+                return (None, loads);
+            };
+            if let Some(next) = siblings.get(position + 1) {
+                return (Some(*next), loads);
+            }
+            if self.group(owner).remaining() == 0 {
+                return (None, loads);
+            }
+            let loaded = self.load_group(owner);
+            if loaded.is_empty() && self.group(owner).remaining() == 0 {
+                return (None, loads);
+            }
+            loads.extend(loaded);
         }
     }
 
-    fn refresh_selected(&mut self, rows: &[ThreadRow]) -> Vec<CommentLoad> {
-        let Some(ThreadRow::Comment { node, .. }) = rows.get(self.selected) else {
-            return Vec::new();
-        };
-        let node = *node;
-        if self.nodes[node].refreshing || matches!(self.nodes[node].state, ThreadNodeState::Loading)
-        {
-            return Vec::new();
-        }
-        self.nodes[node].refreshing = true;
-        vec![self.comment_load(node, CommentUpdate::Revalidation)]
+    fn previous_sibling(&self, node: usize) -> Option<usize> {
+        let owner = self.nodes[node]
+            .parent
+            .map_or(GroupOwner::Root, GroupOwner::Node);
+        let siblings = self.sibling_nodes(owner);
+        let position = siblings.iter().position(|&sibling| sibling == node)?;
+        position
+            .checked_sub(1)
+            .and_then(|position| siblings.get(position).copied())
     }
 
-    fn expand_selected(&mut self, rows: &[ThreadRow]) -> Vec<CommentLoad> {
-        let Some(ThreadRow::Comment { node, .. }) = rows.get(self.selected) else {
-            return Vec::new();
-        };
-        let node = *node;
-        if matches!(self.nodes[node].state, ThreadNodeState::Retryable) {
-            self.nodes[node].state = ThreadNodeState::Loading;
-            return vec![self.comment_load(node, CommentUpdate::Initial)];
-        }
-        self.expand_node(node)
+    fn first_child(&self, node: usize) -> Option<usize> {
+        self.nodes[node]
+            .children
+            .as_ref()?
+            .edges
+            .iter()
+            .find_map(|edge| match edge {
+                ThreadEdge::Node(child) => Some(*child),
+                ThreadEdge::Marker(_) => None,
+            })
+    }
+
+    fn sibling_nodes(&self, owner: GroupOwner) -> Vec<usize> {
+        self.group(owner)
+            .edges
+            .iter()
+            .filter_map(|edge| match edge {
+                ThreadEdge::Node(node) => Some(*node),
+                ThreadEdge::Marker(_) => None,
+            })
+            .collect()
     }
 
     fn expand_node(&mut self, node: usize) -> Vec<CommentLoad> {
-        if self.nodes[node].expanded {
+        self.nodes[node].expanded = true;
+        self.ensure_children(node)
+    }
+
+    fn ensure_children(&mut self, node: usize) -> Vec<CommentLoad> {
+        if self.nodes[node].children.is_some() {
             return Vec::new();
         }
         let child_ids = match &self.nodes[node].state {
@@ -406,16 +634,8 @@ impl CommentThread {
             | ThreadNodeState::Unavailable
             | ThreadNodeState::Retryable => return Vec::new(),
         };
-        if child_ids.is_empty() {
-            return Vec::new();
-        }
-        self.nodes[node].expanded = true;
-        if self.nodes[node].children.is_none() {
-            self.nodes[node].children = Some(SiblingGroup::new(child_ids));
-            self.load_group(GroupOwner::Node(node))
-        } else {
-            Vec::new()
-        }
+        self.nodes[node].children = Some(SiblingGroup::new(child_ids));
+        self.load_group(GroupOwner::Node(node))
     }
 
     fn load_group(&mut self, owner: GroupOwner) -> Vec<CommentLoad> {
@@ -466,7 +686,7 @@ impl CommentThread {
                     depth,
                     state: ThreadNodeState::Loading,
                     refreshing: false,
-                    expanded: false,
+                    expanded: true,
                     children: None,
                 });
                 self.seen.insert(id);
@@ -504,13 +724,23 @@ impl CommentThread {
         false
     }
 
+    fn group(&self, owner: GroupOwner) -> &SiblingGroup {
+        match owner {
+            GroupOwner::Root => &self.roots,
+            GroupOwner::Node(node) => self.nodes[node]
+                .children
+                .as_ref()
+                .expect("materialized comment has a child group"),
+        }
+    }
+
     fn group_mut(&mut self, owner: GroupOwner) -> &mut SiblingGroup {
         match owner {
             GroupOwner::Root => &mut self.roots,
             GroupOwner::Node(node) => self.nodes[node]
                 .children
                 .as_mut()
-                .expect("expanded comment has a child group"),
+                .expect("materialized comment has a child group"),
         }
     }
 
@@ -525,15 +755,6 @@ impl CommentThread {
             node,
             id: self.nodes[node].id,
             update,
-        }
-    }
-
-    fn keep_visible(&mut self, page_len: usize) {
-        let page_len = page_len.max(1);
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        } else if self.selected >= self.offset.saturating_add(page_len) {
-            self.offset = self.selected + 1 - page_len;
         }
     }
 }
@@ -582,14 +803,50 @@ mod tests {
         let (mut thread, loads) = CommentThread::open(10_000, vec![1], 1);
         thread.set_comment(loads[0], Ok(available(1, Vec::new())));
 
-        let (_, first_refresh) = thread.handle_key(Key::Refresh, 10);
-        let (_, duplicate_refresh) = thread.handle_key(Key::Refresh, 10);
+        let (_, first_refresh) = thread.handle_key(Key::Refresh);
+        let (_, duplicate_refresh) = thread.handle_key(Key::Refresh);
         assert_eq!(first_refresh.len(), 1);
         assert!(duplicate_refresh.is_empty());
 
         thread.set_comment(first_refresh[0], Ok(available(1, Vec::new())));
-        let (_, next_refresh) = thread.handle_key(Key::Refresh, 10);
+        let (_, next_refresh) = thread.handle_key(Key::Refresh);
         assert_eq!(next_refresh.len(), 1);
+    }
+
+    #[test]
+    fn selection_stays_on_comment_identity_when_expansion_inserts_rows() {
+        let (mut thread, roots) = CommentThread::open(10_000, vec![1, 2], 1);
+        thread.set_comment(roots[0], Ok(available(1, vec![3])));
+        thread.set_comment(roots[1], Ok(available(2, Vec::new())));
+        thread.handle_key(Key::Down);
+        assert_eq!(thread.selected_comment_id(), Some(2));
+
+        let children = thread.materialize_near(&[roots[0].node]);
+        thread.set_comment(children[0], Ok(available(3, Vec::new())));
+
+        assert_eq!(thread.selected_comment_id(), Some(2));
+        assert_eq!(thread.position(), 2);
+    }
+
+    #[test]
+    fn structural_keys_follow_siblings_parent_and_first_child() {
+        let (mut thread, roots) = CommentThread::open(10_000, vec![1, 2], 1);
+        thread.set_comment(roots[0], Ok(available(1, vec![3, 4])));
+        thread.set_comment(roots[1], Ok(available(2, Vec::new())));
+
+        let (_, children) = thread.handle_key(Key::FirstChild);
+        assert_eq!(children.len(), 2);
+        assert_eq!(thread.selected_comment_id(), Some(3));
+        assert!(thread.structural_actions(children[0].node).parent);
+
+        thread.handle_key(Key::NextSibling);
+        assert_eq!(thread.selected_comment_id(), Some(4));
+        thread.handle_key(Key::PreviousSibling);
+        assert_eq!(thread.selected_comment_id(), Some(3));
+        thread.handle_key(Key::Parent);
+        assert_eq!(thread.selected_comment_id(), Some(1));
+        thread.handle_key(Key::NextSibling);
+        assert_eq!(thread.selected_comment_id(), Some(2));
     }
 
     #[test]
@@ -598,8 +855,7 @@ mod tests {
         for id in 1..=MAX_THREAD_DEPTH {
             let load = loads.pop().expect("one comment at each permitted depth");
             deep.set_comment(load, Ok(available(id as u64, vec![id as u64 + 1])));
-            let node = load.node;
-            loads = deep.expand_node(node);
+            loads = deep.expand_node(load.node);
         }
         assert!(loads.is_empty());
         assert_eq!(deep.nodes.len(), MAX_THREAD_DEPTH);

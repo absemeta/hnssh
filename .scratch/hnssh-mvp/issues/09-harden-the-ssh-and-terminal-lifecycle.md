@@ -1,8 +1,8 @@
-# 08 — Harden the SSH and terminal lifecycle
+# 09 — Harden the SSH and terminal lifecycle
 
 **What to build:** A browsing session remains safe and bounded under unusual SSH requests, fragmented input, oversized dimensions, slow output, timeout, channel closure, and transport failure.
 
-**Blocked by:** 02 — Browse a fixture top feed.
+**Blocked by:** 02 — Browse a fixture top feed; 07 — Make entry links and comment threads direct, navigable, and readable.
 
 **Status:** ready-for-agent
 

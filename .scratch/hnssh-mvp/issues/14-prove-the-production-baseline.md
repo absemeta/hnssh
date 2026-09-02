@@ -1,8 +1,8 @@
-# 13 — Prove the production baseline
+# 14 — Prove the production baseline
 
 **What to build:** Maintainers and operators have repeatable evidence that the complete HNSSH MVP works with representative SSH clients and sustains 200 browsing sessions on an inexpensive Linux VPS while rejecting excess load gracefully.
 
-**Blocked by:** 07 — Keep partial and malformed comment threads usable; 12 — Deploy, drain, and roll back safely.
+**Blocked by:** 08 — Keep partial and malformed comment threads usable; 13 — Deploy, drain, and roll back safely.
 
 **Status:** ready-for-agent
 
