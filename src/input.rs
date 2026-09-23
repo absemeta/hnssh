@@ -17,7 +17,6 @@ pub(crate) enum Key {
     CollapseAll,
     ExpandAll,
     OpenPrimary,
-    Links,
     Back,
     Help,
     Refresh,
@@ -68,6 +67,8 @@ fn decode_one(bytes: &[u8]) -> Decode {
     match first {
         b'k' => Decode::Key(Key::Up, 1),
         b'j' => Decode::Key(Key::Down, 1),
+        b'h' => Decode::Key(Key::Left, 1),
+        b'l' => Decode::Key(Key::Right, 1),
         b'g' => Decode::Key(Key::First, 1),
         b'G' => Decode::Key(Key::Last, 1),
         b'n' => Decode::Key(Key::NextSibling, 1),
@@ -77,10 +78,9 @@ fn decode_one(bytes: &[u8]) -> Decode {
         b'C' => Decode::Key(Key::CollapseAll, 1),
         b'E' => Decode::Key(Key::ExpandAll, 1),
         b'o' => Decode::Key(Key::OpenPrimary, 1),
-        b'l' => Decode::Key(Key::Links, 1),
         b'?' => Decode::Key(Key::Help, 1),
         b'r' => Decode::Key(Key::Refresh, 1),
-        b'q' => Decode::Key(Key::Quit, 1),
+        b'q' | 0x03 => Decode::Key(Key::Quit, 1),
         b' ' => Decode::Key(Key::Toggle, 1),
         b'\r' | b'\n' => Decode::Key(Key::Enter, 1),
         0x08 | 0x7f => Decode::Key(Key::Back, 1),
@@ -159,7 +159,7 @@ mod tests {
         let mut decoder = InputDecoder::default();
 
         assert_eq!(
-            decoder.push(b"jk\x1b[A\x1b[C\x1b[D npPNCEol\x1b[6~?"),
+            decoder.push(b"jk\x1b[A\x1b[C\x1b[D hlnpPNCEo\x1b[6~?\x03"),
             vec![
                 Key::Down,
                 Key::Up,
@@ -167,6 +167,8 @@ mod tests {
                 Key::Right,
                 Key::Left,
                 Key::Toggle,
+                Key::Left,
+                Key::Right,
                 Key::NextSibling,
                 Key::PreviousSibling,
                 Key::Parent,
@@ -174,9 +176,9 @@ mod tests {
                 Key::CollapseAll,
                 Key::ExpandAll,
                 Key::OpenPrimary,
-                Key::Links,
                 Key::PageDown,
                 Key::Help,
+                Key::Quit,
             ]
         );
     }

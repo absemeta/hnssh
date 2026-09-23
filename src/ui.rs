@@ -10,11 +10,28 @@ use crate::browser::{Browser, FeedRowState, FeedStatus, ViewKind};
 use crate::content::{
     Comment, ContentFreshness, EntryDetails, FeedEntry, PollOptionStatus, RichText,
 };
-use crate::thread::{CommentThread, StructuralActions, ThreadNodeState, ThreadRow};
+use crate::content_safety::validated_url;
+use crate::thread::{
+    CollapsedComments, CommentThread, StructuralActions, ThreadNodeState, ThreadRow,
+};
 
 pub(crate) const MIN_COLUMNS: u16 = 60;
 pub(crate) const MIN_ROWS: u16 = 16;
 const MAX_VISIBLE_GUIDES: usize = 10;
+
+#[derive(Debug, Default)]
+pub(crate) struct RenderOutput {
+    pub(crate) comment_candidates: Vec<usize>,
+    pub(crate) hyperlinks: Vec<TerminalHyperlink>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TerminalHyperlink {
+    pub(crate) column: u16,
+    pub(crate) row: u16,
+    pub(crate) text: String,
+    pub(crate) destination: String,
+}
 
 pub(crate) fn page_len(rows: u16) -> usize {
     usize::from(rows.saturating_sub(3) / 2).max(1)
@@ -22,36 +39,32 @@ pub(crate) fn page_len(rows: u16) -> usize {
 
 pub(crate) fn navigation_page_len(view: ViewKind, rows: u16) -> usize {
     match view {
-        ViewKind::Entry => usize::from(rows.saturating_sub(4)).max(1),
-        ViewKind::Feed | ViewKind::Links => page_len(rows),
+        ViewKind::Entry => usize::from(rows.saturating_sub(3)).max(1),
+        ViewKind::Feed => page_len(rows),
         ViewKind::Destination | ViewKind::Help => usize::from(rows.saturating_sub(2)).max(1),
     }
 }
 
-pub(crate) fn render(frame: &mut Frame<'_>, browser: &mut Browser, size: Rect) -> Vec<usize> {
+pub(crate) fn render(frame: &mut Frame<'_>, browser: &mut Browser, size: Rect) -> RenderOutput {
     if (size.width < MIN_COLUMNS || size.height < MIN_ROWS) && browser.view_kind() != ViewKind::Help
     {
         render_resize(frame, size);
-        return Vec::new();
+        return RenderOutput::default();
     }
 
     match browser.view_kind() {
         ViewKind::Feed => {
             render_feed(frame, browser, size);
-            Vec::new()
+            RenderOutput::default()
         }
         ViewKind::Entry => render_entry(frame, browser, size),
-        ViewKind::Links => {
-            render_links(frame, browser, size);
-            Vec::new()
-        }
-        ViewKind::Destination => {
-            render_destination(frame, browser, size);
-            Vec::new()
-        }
+        ViewKind::Destination => RenderOutput {
+            hyperlinks: render_destination(frame, browser, size),
+            ..RenderOutput::default()
+        },
         ViewKind::Help => {
             render_help(frame, browser, size);
-            Vec::new()
+            RenderOutput::default()
         }
     }
 }
@@ -70,7 +83,7 @@ fn render_resize(frame: &mut Frame<'_>, size: Rect) {
         )),
         Line::from("Resize the terminal to browse the top feed."),
         Line::from(""),
-        Line::from("? help   q quit"),
+        Line::from("? help   q/Ctrl+C quit"),
     ];
     let panel = Paragraph::new(lines)
         .alignment(Alignment::Center)
@@ -139,10 +152,8 @@ fn render_feed(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
     }
     frame.render_widget(Paragraph::new(lines), inner);
     frame.render_widget(
-        Paragraph::new(
-            "j/k move · Enter open · o destination · l links · r refresh · ? help · q quit",
-        )
-        .alignment(Alignment::Center),
+        Paragraph::new("j/k move · Enter open · o URL · r refresh · ? help · q/Ctrl+C quit")
+            .alignment(Alignment::Center),
         footer,
     );
 }
@@ -153,22 +164,43 @@ struct CommentLineRange {
     end: usize,
 }
 
+struct EntryHyperlink {
+    line: usize,
+    column: usize,
+    text: String,
+    destination: String,
+}
+
+struct AnnotatedHyperlink {
+    column: usize,
+    text: String,
+    destination: String,
+}
+
+struct AnnotatedLine {
+    line: Line<'static>,
+    hyperlinks: Vec<AnnotatedHyperlink>,
+}
+
 struct EntryLayout {
     lines: Vec<Line<'static>>,
     comments: Vec<CommentLineRange>,
+    hyperlinks: Vec<EntryHyperlink>,
 }
 
-fn render_entry(frame: &mut Frame<'_>, browser: &mut Browser, size: Rect) -> Vec<usize> {
-    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(size);
-    let block = Block::default()
-        .title(" HNSSH · Entry ")
-        .borders(Borders::ALL);
+fn render_entry(frame: &mut Frame<'_>, browser: &mut Browser, size: Rect) -> RenderOutput {
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(size);
+    let panel_title = browser.current_entry().map_or_else(
+        || " [entry unavailable] ".to_owned(),
+        |entry| entry_panel_title(entry.title(), body.width),
+    );
+    let block = Block::default().title(panel_title).borders(Borders::ALL);
     let inner = block.inner(body);
     frame.render_widget(block, body);
 
     let Some(entry) = browser.current_entry() else {
         frame.render_widget(Paragraph::new("Entry unavailable"), inner);
-        return Vec::new();
+        return RenderOutput::default();
     };
     let layout = entry_layout(browser, entry, usize::from(inner.width.max(1)));
     let viewport_height = usize::from(inner.height.max(1));
@@ -183,37 +215,69 @@ fn render_entry(frame: &mut Frame<'_>, browser: &mut Browser, size: Rect) -> Vec
     });
     browser.reconcile_entry_viewport(selected_header, viewport_height, maximum);
     let scroll = browser.entry_scroll();
-    frame.render_widget(
-        Paragraph::new(layout.lines).scroll((usize_to_u16(scroll), 0)),
-        inner,
-    );
 
     let near_start = scroll.saturating_sub(viewport_height);
     let near_end = scroll.saturating_add(viewport_height.saturating_mul(2));
-    let candidates = layout
+    let comment_candidates = layout
         .comments
         .iter()
         .filter(|range| range.end >= near_start && range.start <= near_end)
         .map(|range| range.node)
         .collect();
-
+    let hyperlinks = layout
+        .hyperlinks
+        .iter()
+        .filter(|link| link.line >= scroll && link.line < scroll.saturating_add(viewport_height))
+        .map(|link| TerminalHyperlink {
+            column: inner.x.saturating_add(usize_to_u16(link.column)),
+            row: inner
+                .y
+                .saturating_add(usize_to_u16(link.line.saturating_sub(scroll))),
+            text: link.text.clone(),
+            destination: link.destination.clone(),
+        })
+        .collect();
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(
-                "j/k linear · n/p siblings · P parent · N child · Space or ←/→ collapse/expand",
-            ),
-            Line::from(
-                "PgUp/PgDn read · C/E all · o destination · l links · Esc back · ? help · q quit",
-            ),
-        ])
-        .alignment(Alignment::Center),
+        Paragraph::new(layout.lines).scroll((usize_to_u16(scroll), 0)),
+        inner,
+    );
+    frame.render_widget(
+        Paragraph::new("? help · Enter load/retry · Esc back").alignment(Alignment::Center),
         footer,
     );
-    candidates
+    RenderOutput {
+        comment_candidates,
+        hyperlinks,
+    }
+}
+
+fn entry_panel_title(title: &str, width: u16) -> String {
+    let available = usize::from(width.saturating_sub(4));
+    if available == 0 {
+        return String::new();
+    }
+    if Line::from(title).width() <= available {
+        return format!(" {title} ");
+    }
+
+    let content_width = available.saturating_sub(1);
+    let mut trimmed = String::new();
+    let mut used: usize = 0;
+    for character in title.chars() {
+        let character_width = Line::from(character.to_string()).width().max(1);
+        if used.saturating_add(character_width) > content_width {
+            break;
+        }
+        trimmed.push(character);
+        used = used.saturating_add(character_width);
+    }
+    format!(" {trimmed}… ")
 }
 
 fn entry_layout(browser: &Browser, entry: &FeedEntry, width: usize) -> EntryLayout {
-    let mut lines = physical_lines(entry_lines(entry), width);
+    let mut lines = Vec::new();
+    let mut hyperlinks = Vec::new();
+    append_annotated_lines(&mut lines, &mut hyperlinks, entry_lines(entry, width), 0);
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Comments",
@@ -226,6 +290,7 @@ fn entry_layout(browser: &Browser, entry: &FeedEntry, width: usize) -> EntryLayo
         return EntryLayout {
             lines,
             comments: Vec::new(),
+            hyperlinks,
         };
     };
     let rows = thread.rows();
@@ -234,13 +299,15 @@ fn entry_layout(browser: &Browser, entry: &FeedEntry, width: usize) -> EntryLayo
         return EntryLayout {
             lines,
             comments: Vec::new(),
+            hyperlinks,
         };
     }
 
     let selected_position = thread.position();
+    let selection_engaged = thread.comment_selection_engaged();
     let mut comments = Vec::new();
     for (position, row) in rows.iter().enumerate() {
-        let selected = position == selected_position;
+        let selected = selection_engaged && position == selected_position;
         match row {
             ThreadRow::Comment {
                 node,
@@ -250,7 +317,15 @@ fn entry_layout(browser: &Browser, entry: &FeedEntry, width: usize) -> EntryLayo
             } => {
                 let start = lines.len();
                 append_comment(
-                    &mut lines, thread, *node, *depth, guides, *is_last, selected, width,
+                    &mut lines,
+                    &mut hyperlinks,
+                    thread,
+                    *node,
+                    *depth,
+                    guides,
+                    *is_last,
+                    selected,
+                    width,
                 );
                 comments.push(CommentLineRange {
                     node: *node,
@@ -291,12 +366,40 @@ fn entry_layout(browser: &Browser, entry: &FeedEntry, width: usize) -> EntryLayo
         }
     }
 
-    EntryLayout { lines, comments }
+    EntryLayout {
+        lines,
+        comments,
+        hyperlinks,
+    }
+}
+
+fn append_annotated_lines(
+    lines: &mut Vec<Line<'static>>,
+    hyperlinks: &mut Vec<EntryHyperlink>,
+    annotated_lines: Vec<AnnotatedLine>,
+    column_offset: usize,
+) {
+    for annotated in annotated_lines {
+        let line = lines.len();
+        hyperlinks.extend(
+            annotated
+                .hyperlinks
+                .into_iter()
+                .map(|hyperlink| EntryHyperlink {
+                    line,
+                    column: column_offset.saturating_add(hyperlink.column),
+                    text: hyperlink.text,
+                    destination: hyperlink.destination,
+                }),
+        );
+        lines.push(annotated.line);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn append_comment(
     lines: &mut Vec<Line<'static>>,
+    hyperlinks: &mut Vec<EntryHyperlink>,
     thread: &CommentThread,
     node_index: usize,
     depth: usize,
@@ -326,7 +429,8 @@ fn append_comment(
     let header = if node.expanded() {
         format!("{marker} {tree}{branch} {author}{metadata}")
     } else {
-        format!("{marker} {tree}{branch} {author}")
+        let collapsed = collapsed_comment_label(thread.collapsed_comments(node_index));
+        format!("{marker} {tree}{branch} {author}{collapsed}")
     };
     let style = if selected {
         selected_style(true).add_modifier(Modifier::UNDERLINED)
@@ -350,11 +454,22 @@ fn append_comment(
         ThreadNodeState::Ready(snapshot) => match &snapshot.value {
             Comment::Available(details) => {
                 if let Some(text) = &details.text {
-                    for rich_line in render_rich_text(text) {
-                        for mut wrapped in wrap_styled_line(rich_line, body_width) {
-                            wrapped.spans.insert(0, Span::from(body_prefix.clone()));
-                            lines.push(wrapped);
-                        }
+                    let prefix_width = Line::from(body_prefix.clone()).width();
+                    for mut annotated in render_rich_text(text, body_width) {
+                        let line_number = lines.len();
+                        hyperlinks.extend(annotated.hyperlinks.into_iter().map(|hyperlink| {
+                            EntryHyperlink {
+                                line: line_number,
+                                column: prefix_width.saturating_add(hyperlink.column),
+                                text: hyperlink.text,
+                                destination: hyperlink.destination,
+                            }
+                        }));
+                        annotated
+                            .line
+                            .spans
+                            .insert(0, Span::from(body_prefix.clone()));
+                        lines.push(annotated.line);
                     }
                 } else {
                     lines.push(Line::from(format!(
@@ -428,6 +543,18 @@ fn comment_header(node: &crate::thread::ThreadNode) -> (String, String) {
     }
 }
 
+fn collapsed_comment_label(summary: CollapsedComments) -> String {
+    match (summary.count, summary.exact) {
+        (0, true) => String::new(),
+        (0, false) => " · comments collapsed (count unavailable)".to_owned(),
+        (count, exact) => {
+            let lower_bound = if exact { "" } else { "+" };
+            let noun = if count == 1 { "comment" } else { "comments" };
+            format!(" · {count}{lower_bound} {noun} collapsed")
+        }
+    }
+}
+
 fn structural_helper(actions: StructuralActions) -> String {
     let mut labels = Vec::new();
     if actions.parent {
@@ -476,75 +603,107 @@ fn bounded_guides(depth: usize, guides: &[bool]) -> String {
     prefix
 }
 
-fn render_links(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
+fn render_destination(
+    frame: &mut Frame<'_>,
+    browser: &Browser,
+    size: Rect,
+) -> Vec<TerminalHyperlink> {
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(size);
-    let links = browser.current_links();
-    let (selected, offset) = browser.link_position();
-    let mut lines = Vec::new();
-
-    if links.is_empty() {
-        lines.push(Line::from(
-            "No validated links are available in this context.",
-        ));
-    }
-    for (index, link) in links
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(page_len(size.height))
-    {
-        let marker = if index == selected { ">" } else { " " };
-        lines.push(Line::from(Span::styled(
-            format!("{marker} {}", link.label),
-            selected_style(index == selected),
-        )));
-        lines.push(Line::from(format!("  {}", link.destination)));
-    }
-
-    let panel = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .title(format!(" HNSSH · {} ", browser.link_view_title()))
-            .borders(Borders::ALL),
+    let hyperlinks = render_link_destination_panel(
+        frame,
+        body,
+        "Primary destination",
+        browser.current_destination(),
+        "No primary external destination is available for this entry.",
     );
-    frame.render_widget(panel, body);
     frame.render_widget(
-        Paragraph::new(
-            "j/k move · o primary destination · Escape/Backspace back · ? help · q quit",
-        )
-        .alignment(Alignment::Center),
+        Paragraph::new("Escape/Backspace back · ? help · q/Ctrl+C quit")
+            .alignment(Alignment::Center),
         footer,
     );
+    hyperlinks
 }
 
-fn render_destination(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
-    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(size);
+fn render_link_destination_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    link: Option<&crate::content::Link>,
+    empty_message: &str,
+) -> Vec<TerminalHyperlink> {
+    let block = Block::default()
+        .title(format!(" HNSSH · {title} "))
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
     let mut lines = vec![
-        Line::from("Use your terminal's native URL detection or copy the text below."),
+        Line::from("Cmd/Ctrl-click the URL below, or copy it."),
         Line::from(""),
     ];
-    if let Some(link) = browser.primary_destination() {
-        lines.push(Line::from(Span::styled(
-            link.label.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(link.destination.clone()));
+    let hyperlinks = if let Some(link) = link {
+        let validated_destination = validated_url(&link.destination);
+        let destination_style = if validated_destination.is_some() {
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default()
+        };
+        let destination_lines = wrap_styled_line(
+            Line::from(Span::styled(link.destination.clone(), destination_style)),
+            usize::from(inner.width.max(1)),
+        );
+        let destination_chunks = destination_lines.iter().map(line_text).collect::<Vec<_>>();
+        lines.extend(destination_lines);
+        if should_show_link_label(link) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                link.label.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        }
+
+        validated_destination.map_or_else(Vec::new, |destination| {
+            destination_chunks
+                .into_iter()
+                .take(usize::from(inner.height.saturating_sub(2)))
+                .enumerate()
+                .map(|(index, text)| TerminalHyperlink {
+                    column: inner.x,
+                    row: inner
+                        .y
+                        .saturating_add(2)
+                        .saturating_add(usize_to_u16(index)),
+                    text,
+                    destination: destination.destination.clone(),
+                })
+                .collect()
+        })
     } else {
-        lines.push(Line::from(
-            "No primary external destination is available for this entry.",
-        ));
-    }
+        lines.push(Line::from(empty_message.to_owned()));
+        Vec::new()
+    };
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(" HNSSH · Primary destination ")
-                .borders(Borders::ALL),
-        ),
-        body,
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
     );
-    frame.render_widget(
-        Paragraph::new("Escape/Backspace back · ? help · q quit").alignment(Alignment::Center),
-        footer,
-    );
+    hyperlinks
+}
+
+fn should_show_link_label(link: &crate::content::Link) -> bool {
+    let label = link.label.trim();
+    !label.is_empty()
+        && label != link.destination
+        && !label.starts_with("http://")
+        && !label.starts_with("https://")
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans.iter().fold(String::new(), |mut text, span| {
+        text.push_str(&span.content);
+        text
+    })
 }
 
 fn render_help(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
@@ -554,22 +713,23 @@ fn render_help(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("Up / k                 Select previous visible row"),
-        Line::from("Down / j               Select next visible row"),
+        Line::from("Up / k                 Previous comment; from first, return to Entry top"),
+        Line::from("Down / j               Enter comments or select the next visible row"),
         Line::from("Page Up / Page Down    Page through feed or rendered Entry content"),
         Line::from("g / G                  First / last feed row or Entry content"),
         Line::from("Enter                  Open an Entry; load or retry selected comments"),
-        Line::from("Left / Right           Collapse or move to parent / expand a comment"),
+        Line::from("Left / h               Collapse a comment or move to its parent"),
+        Line::from("Right / l              Expand the selected comment"),
         Line::from("Space                  Toggle the selected comment subtree"),
         Line::from("n / p                  Next / previous sibling comment"),
         Line::from("P / N                  Parent / first child comment"),
         Line::from("C / E                  Collapse / expand the whole Comment thread"),
         Line::from("o                      Expose the primary external destination"),
-        Line::from("l                      Open contextual validated links"),
+        Line::from("Linked text            Cmd/Ctrl-click to open in your browser"),
         Line::from("Escape / Backspace     Return to the previous view"),
         Line::from("?                      Open this help"),
         Line::from("r                      Refresh the feed or selected comment"),
-        Line::from("q                      Quit HNSSH"),
+        Line::from("q / Ctrl+C             Quit HNSSH"),
     ];
     let panel = Paragraph::new(lines)
         .scroll((browser.current_scroll(), 0))
@@ -582,38 +742,48 @@ fn render_help(frame: &mut Frame<'_>, browser: &Browser, size: Rect) {
     frame.render_widget(panel, size);
 }
 
-fn entry_lines(entry: &FeedEntry) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(Span::styled(
-        entry.title().to_owned(),
-        Style::default().add_modifier(Modifier::BOLD),
-    ))];
+fn entry_lines(entry: &FeedEntry, width: usize) -> Vec<AnnotatedLine> {
+    let mut lines = Vec::new();
+    push_plain_line(
+        &mut lines,
+        Line::from(Span::styled(
+            entry.title().to_owned(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        width,
+    );
     let mut context = vec![entry.kind_label().to_owned()];
     if let Some(details) = entry.details() {
         append_compact_metadata(&mut context, details);
     }
-    lines.push(Line::from(context.join(" · ")));
+    push_plain_line(&mut lines, Line::from(context.join(" · ")), width);
     if let Some(details) = entry.details() {
         if let Some(published_at) = details.published_at {
-            lines.push(Line::from(format!(
-                "Published: {}",
-                absolute_utc(published_at)
-            )));
+            push_plain_line(
+                &mut lines,
+                Line::from(format!("Published: {}", absolute_utc(published_at))),
+                width,
+            );
         }
         if let Some(text) = &details.text {
-            lines.push(Line::from(""));
-            lines.extend(render_rich_text(text));
+            push_plain_line(&mut lines, Line::from(""), width);
+            lines.extend(render_rich_text(text, width));
         }
         if details.omitted_link_count > 0 {
-            lines.push(Line::from(""));
-            lines.push(Line::from(format!(
-                "Unsafe or malformed links omitted: {}",
-                details.omitted_link_count
-            )));
+            push_plain_line(&mut lines, Line::from(""), width);
+            push_plain_line(
+                &mut lines,
+                Line::from(format!(
+                    "Unsafe or malformed links omitted: {}",
+                    details.omitted_link_count
+                )),
+                width,
+            );
         }
     }
     if let FeedEntry::Poll { options, .. } = entry {
-        lines.push(Line::from(""));
-        lines.push(Line::from("Poll options:"));
+        push_plain_line(&mut lines, Line::from(""), width);
+        push_plain_line(&mut lines, Line::from("Poll options:"), width);
         for option in options {
             let score = option
                 .score
@@ -626,10 +796,25 @@ fn entry_lines(entry: &FeedEntry) -> Vec<Line<'static>> {
                     " · not loaded".to_owned()
                 }
             };
-            lines.push(Line::from(format!("• {}{score}{status}", option.text)));
+            push_plain_line(
+                &mut lines,
+                Line::from(format!("• {}{score}{status}", option.text)),
+                width,
+            );
         }
     }
     lines
+}
+
+fn push_plain_line(lines: &mut Vec<AnnotatedLine>, line: Line<'static>, width: usize) {
+    lines.extend(
+        wrap_styled_line(line, width)
+            .into_iter()
+            .map(|line| AnnotatedLine {
+                line,
+                hyperlinks: Vec::new(),
+            }),
+    );
 }
 
 fn append_compact_metadata(context: &mut Vec<String>, details: &EntryDetails) {
@@ -648,13 +833,6 @@ fn append_compact_metadata(context: &mut Vec<String>, details: &EntryDetails) {
     if let Some(comment_count) = details.comment_count {
         context.push(comments(comment_count));
     }
-}
-
-fn physical_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .flat_map(|line| wrap_styled_line(line, width.max(1)))
-        .collect()
 }
 
 fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
@@ -690,33 +868,108 @@ fn push_segment(spans: &mut Vec<Span<'static>>, segment: &mut String, style: Sty
     }
 }
 
-fn render_rich_text(text: &RichText) -> Vec<Line<'static>> {
-    text.lines
-        .iter()
-        .map(|line| {
-            let mut spans = Vec::new();
-            if line.preformatted {
-                spans.push(Span::from("│ "));
+fn render_rich_text(text: &RichText, width: usize) -> Vec<AnnotatedLine> {
+    let width = width.max(1);
+    let mut output = Vec::new();
+
+    for rich_line in &text.lines {
+        let mut source_spans = Vec::new();
+        if rich_line.preformatted {
+            source_spans.push(("│ ".to_owned(), Style::default(), None));
+        }
+        for span in &rich_line.spans {
+            let mut style = Style::default();
+            if span.style.emphasis {
+                style = style.add_modifier(Modifier::ITALIC);
             }
-            spans.extend(line.spans.iter().map(|span| {
-                let mut style = Style::default();
-                if span.style.emphasis {
-                    style = style.add_modifier(Modifier::ITALIC);
+            if span.style.strong {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if span.style.code {
+                style = style.fg(Color::Cyan).add_modifier(Modifier::REVERSED);
+            }
+            let destination = span
+                .link_destination
+                .as_deref()
+                .and_then(validated_url)
+                .map(|url| url.destination);
+            if destination.is_some() {
+                style = Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::UNDERLINED);
+            }
+            source_spans.push((span.text.clone(), style, destination));
+        }
+
+        let mut current_spans = Vec::new();
+        let mut current_hyperlinks = Vec::new();
+        let mut current_width = 0usize;
+        for (text, style, destination) in source_spans {
+            let mut segment = String::new();
+            let mut segment_start = current_width;
+            for character in text.chars() {
+                let character_width = Line::from(character.to_string()).width().max(1);
+                if current_width.saturating_add(character_width) > width && current_width > 0 {
+                    push_rich_segment(
+                        &mut current_spans,
+                        &mut current_hyperlinks,
+                        &mut segment,
+                        segment_start,
+                        style,
+                        destination.as_deref(),
+                    );
+                    output.push(AnnotatedLine {
+                        line: Line::from(std::mem::take(&mut current_spans)),
+                        hyperlinks: std::mem::take(&mut current_hyperlinks),
+                    });
+                    current_width = 0;
+                    segment_start = 0;
                 }
-                if span.style.strong {
-                    style = style.add_modifier(Modifier::BOLD);
+                if segment.is_empty() {
+                    segment_start = current_width;
                 }
-                if span.style.code {
-                    style = style.fg(Color::Cyan).add_modifier(Modifier::REVERSED);
-                }
-                if span.style.link {
-                    style = style.add_modifier(Modifier::UNDERLINED);
-                }
-                Span::styled(span.text.clone(), style)
-            }));
-            Line::from(spans)
-        })
-        .collect()
+                segment.push(character);
+                current_width = current_width.saturating_add(character_width);
+            }
+            push_rich_segment(
+                &mut current_spans,
+                &mut current_hyperlinks,
+                &mut segment,
+                segment_start,
+                style,
+                destination.as_deref(),
+            );
+        }
+        if !current_spans.is_empty() || output.is_empty() || rich_line.spans.is_empty() {
+            output.push(AnnotatedLine {
+                line: Line::from(current_spans),
+                hyperlinks: current_hyperlinks,
+            });
+        }
+    }
+    output
+}
+
+fn push_rich_segment(
+    spans: &mut Vec<Span<'static>>,
+    hyperlinks: &mut Vec<AnnotatedHyperlink>,
+    segment: &mut String,
+    column: usize,
+    style: Style,
+    destination: Option<&str>,
+) {
+    if segment.is_empty() {
+        return;
+    }
+    let text = std::mem::take(segment);
+    if let Some(destination) = destination {
+        hyperlinks.push(AnnotatedHyperlink {
+            column,
+            text: text.clone(),
+            destination: destination.to_owned(),
+        });
+    }
+    spans.push(Span::styled(text, style));
 }
 
 fn selected_style(selected: bool) -> Style {
@@ -828,4 +1081,52 @@ fn quantity(value: u64, unit: &str) -> String {
 
 fn usize_to_u16(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_panel_title_replaces_the_generic_label_and_fits_the_border() {
+        assert_eq!(entry_panel_title("A short title", 40), " A short title ");
+
+        let title = entry_panel_title("abcdefghijk", 12);
+        assert_eq!(title, " abcdefg… ");
+        assert!(Line::from(title).width() <= 10);
+    }
+
+    #[test]
+    fn destination_does_not_repeat_a_url_shaped_label() {
+        let truncated_url_label = crate::content::Link::new(
+            "https://example.com/a-long-path…",
+            "https://example.com/a-long-path",
+        );
+        let descriptive_label =
+            crate::content::Link::new("Documentation", "https://example.com/docs");
+
+        assert!(!should_show_link_label(&truncated_url_label));
+        assert!(should_show_link_label(&descriptive_label));
+    }
+
+    #[test]
+    fn wrapped_rich_links_keep_clickable_chunks_at_their_visible_columns() {
+        let normalized = crate::content_safety::normalize_html(
+            "xx<a href='https://example.com/docs'>abcdef</a>",
+        );
+        let rendered = render_rich_text(&normalized.text, 5);
+        let hyperlinks = rendered
+            .iter()
+            .flat_map(|line| &line.hyperlinks)
+            .map(|link| (link.column, link.text.as_str(), link.destination.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            hyperlinks,
+            vec![
+                (2, "abc", "https://example.com/docs"),
+                (0, "def", "https://example.com/docs"),
+            ]
+        );
+    }
 }

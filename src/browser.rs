@@ -57,7 +57,6 @@ impl FeedRow {
 pub(crate) enum ViewKind {
     Feed,
     Entry,
-    Links,
     Destination,
     Help,
 }
@@ -71,13 +70,6 @@ enum ViewState {
     Entry {
         row: usize,
         entry_id: FeedEntryId,
-    },
-    Links {
-        row: usize,
-        title: String,
-        links: Vec<Link>,
-        selected: usize,
-        offset: usize,
     },
     Destination {
         row: usize,
@@ -369,7 +361,6 @@ impl Browser {
         match self.views.last().expect("browser always has a root view") {
             ViewState::Feed { .. } => ViewKind::Feed,
             ViewState::Entry { .. } => ViewKind::Entry,
-            ViewState::Links { .. } => ViewKind::Links,
             ViewState::Destination { .. } => ViewKind::Destination,
             ViewState::Help { .. } => ViewKind::Help,
         }
@@ -442,45 +433,24 @@ impl Browser {
         }
     }
 
-    pub(crate) fn materialize_current_comments(&mut self, nodes: &[usize]) -> Vec<CommentLoad> {
-        self.current_thread_mut()
-            .map_or_else(Vec::new, |thread| thread.materialize_near(nodes))
+    pub(crate) fn materialize_current_comments(
+        &mut self,
+        nodes: &[usize],
+    ) -> (bool, Vec<CommentLoad>) {
+        self.current_thread_mut().map_or_else(
+            || (false, Vec::new()),
+            |thread| thread.materialize_near(nodes),
+        )
     }
 
     pub(crate) fn current_scroll(&self) -> u16 {
         match self.views.last().expect("browser always has a root view") {
             ViewState::Help { scroll } => *scroll,
-            ViewState::Feed { .. }
-            | ViewState::Entry { .. }
-            | ViewState::Links { .. }
-            | ViewState::Destination { .. } => 0,
+            ViewState::Feed { .. } | ViewState::Entry { .. } | ViewState::Destination { .. } => 0,
         }
     }
 
-    pub(crate) fn link_position(&self) -> (usize, usize) {
-        match self.views.last().expect("browser always has a root view") {
-            ViewState::Links {
-                selected, offset, ..
-            } => (*selected, *offset),
-            _ => (0, 0),
-        }
-    }
-
-    pub(crate) fn current_links(&self) -> &[Link] {
-        match self.views.last() {
-            Some(ViewState::Links { links, .. }) => links,
-            _ => &[],
-        }
-    }
-
-    pub(crate) fn link_view_title(&self) -> &str {
-        match self.views.last() {
-            Some(ViewState::Links { title, .. }) => title,
-            _ => "Links",
-        }
-    }
-
-    pub(crate) fn primary_destination(&self) -> Option<&Link> {
+    pub(crate) fn current_destination(&self) -> Option<&Link> {
         match self.views.last() {
             Some(ViewState::Destination { destination, .. }) => destination.as_ref(),
             _ => None,
@@ -534,14 +504,9 @@ impl Browser {
         if key == Key::OpenPrimary {
             return self.open_primary_destination();
         }
-        if key == Key::Links {
-            return self.open_contextual_links();
-        }
-
         match self.view_kind() {
             ViewKind::Feed => self.handle_feed_key(key, page_len.max(1)),
             ViewKind::Entry => self.handle_entry_key(key, page_len.max(1)),
-            ViewKind::Links => self.handle_links_key(key, page_len.max(1)),
             ViewKind::Destination => CommandOutcome::Unchanged,
             ViewKind::Help => self.handle_help_key(key, page_len.max(1)),
         }
@@ -642,6 +607,16 @@ impl Browser {
             return CommandOutcome::Unchanged;
         };
         let (changed, loads) = thread.handle_key(key);
+        let returned_to_entry = key == Key::Up && changed && !thread.comment_selection_engaged();
+        if returned_to_entry {
+            let Some(ViewState::Entry { entry_id, .. }) = self.views.last() else {
+                unreachable!()
+            };
+            self.entry_states
+                .get_mut(entry_id)
+                .expect("open entry has session state")
+                .scroll = 0;
+        }
         if !loads.is_empty() {
             self.pending_comment_loads.extend(loads);
             CommandOutcome::LoadComments
@@ -653,10 +628,7 @@ impl Browser {
     }
 
     fn open_primary_destination(&mut self) -> CommandOutcome {
-        if !matches!(
-            self.view_kind(),
-            ViewKind::Feed | ViewKind::Entry | ViewKind::Links
-        ) {
+        if !matches!(self.view_kind(), ViewKind::Feed | ViewKind::Entry) {
             return CommandOutcome::Unchanged;
         }
         let Some(row) = self.current_row() else {
@@ -670,74 +642,6 @@ impl Browser {
         CommandOutcome::Redraw
     }
 
-    fn open_contextual_links(&mut self) -> CommandOutcome {
-        let Some(row) = self.current_row() else {
-            return CommandOutcome::Unchanged;
-        };
-        let (title, links) = match self.view_kind() {
-            ViewKind::Feed => {
-                let Some(entry) = self.rows.get(row).and_then(FeedRow::entry) else {
-                    return CommandOutcome::Unchanged;
-                };
-                ("Feed entry links".to_owned(), entry.links().to_vec())
-            }
-            ViewKind::Entry => {
-                if let Some(thread) = self.current_thread()
-                    && let Some(comment_id) = thread.selected_comment_id()
-                {
-                    (
-                        format!("Comment {comment_id} links"),
-                        thread.selected_links().unwrap_or(&[]).to_vec(),
-                    )
-                } else {
-                    let Some(entry) = self.rows.get(row).and_then(FeedRow::entry) else {
-                        return CommandOutcome::Unchanged;
-                    };
-                    ("Entry links".to_owned(), entry.links().to_vec())
-                }
-            }
-            ViewKind::Links | ViewKind::Destination | ViewKind::Help => {
-                return CommandOutcome::Unchanged;
-            }
-        };
-        self.views.push(ViewState::Links {
-            row,
-            title,
-            links,
-            selected: 0,
-            offset: 0,
-        });
-        CommandOutcome::Redraw
-    }
-
-    fn handle_links_key(&mut self, key: Key, page_len: usize) -> CommandOutcome {
-        let link_count = self.current_links().len();
-        let last = link_count.saturating_sub(1);
-        let ViewState::Links {
-            selected, offset, ..
-        } = self.views.last_mut().expect("links exists")
-        else {
-            unreachable!()
-        };
-        let previous = (*selected, *offset);
-        *selected = match key {
-            Key::Up => selected.saturating_sub(1),
-            Key::Down => selected.saturating_add(1).min(last),
-            Key::PageUp => selected.saturating_sub(page_len),
-            Key::PageDown => selected.saturating_add(page_len).min(last),
-            Key::First => 0,
-            Key::Last => last,
-            _ => return CommandOutcome::Unchanged,
-        };
-        keep_visible(*selected, offset, page_len);
-
-        if previous == (*selected, *offset) {
-            CommandOutcome::Unchanged
-        } else {
-            CommandOutcome::Redraw
-        }
-    }
-
     fn handle_help_key(&mut self, key: Key, page_len: usize) -> CommandOutcome {
         let ViewState::Help { scroll } = self.views.last_mut().expect("help exists") else {
             unreachable!()
@@ -748,9 +652,7 @@ impl Browser {
     fn current_row(&self) -> Option<usize> {
         match self.views.last()? {
             ViewState::Feed { selected, .. } => Some(*selected),
-            ViewState::Entry { row, .. }
-            | ViewState::Links { row, .. }
-            | ViewState::Destination { row, .. } => Some(*row),
+            ViewState::Entry { row, .. } | ViewState::Destination { row, .. } => Some(*row),
             ViewState::Help { .. } => None,
         }
     }

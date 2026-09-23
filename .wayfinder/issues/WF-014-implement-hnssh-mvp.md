@@ -57,7 +57,7 @@ Visitors will navigate with documented keyboard controls, see explicit loading, 
 28. As a visitor, I want to open a feed entry's detail view, so that I can inspect all available metadata and text.
 29. As a visitor, I want paragraphs, emphasis, and code to remain distinguishable, so that Hacker News text is readable without exposing HTML markup.
 30. As a visitor, I want unsupported HTML to degrade to readable text, so that historical or unexpected markup does not break rendering.
-31. As a visitor, I want external and inline links collected in a link view with their full validated destinations, so that I can copy or use my terminal's URL handling.
+31. As a visitor, I want validated inline links to remain clickable in story and comment text, so that I can follow them without leaving what I am reading.
 32. As a visitor, I want unsafe or malformed URLs excluded from activation and clearly marked, so that upstream content cannot inject terminal behavior.
 33. As a visitor, I want long titles, text, code, and URLs wrapped or horizontally constrained, so that they do not corrupt the layout.
 34. As a visitor, I want to open a story's comment thread, so that I can read the conversation from the terminal.
@@ -71,7 +71,7 @@ Visitors will navigate with documented keyboard controls, see explicit loading, 
 42. As a visitor, I want an explicit limit message if a thread reaches the MVP's depth or loaded-node safety cap, so that bounded behavior is not mistaken for a complete thread.
 43. As a visitor, I want malformed cycles or duplicate child references handled safely, so that unexpected upstream data cannot hang the browsing session.
 44. As a visitor, I want Hacker News content stripped of terminal control characters, so that titles and comments cannot manipulate my terminal.
-45. As a visitor, I want `q` to exit cleanly, so that the cursor, style, and alternate screen are restored on normal disconnect.
+45. As a visitor, I want `q` or Ctrl+C to exit cleanly, so that the cursor, style, and alternate screen are restored on normal disconnect.
 46. As a visitor, I want network loss or an SSH channel close to cancel work for my browsing session, so that disconnected sessions do not consume server resources.
 47. As a visitor, I want unsupported shell, command, subsystem, forwarding, and extra-channel requests rejected, so that HNSSH cannot become a general-purpose SSH service.
 48. As a visitor, I want a warning before an idle, maximum-duration, or planned-restart disconnect when the channel is writable, so that the closure is understandable.
@@ -107,11 +107,11 @@ Visitors will navigate with documented keyboard controls, see explicit loading, 
 
 ### Product and interaction
 
-- The MVP has five visitor-visible views: top feed, feed-entry details, comment thread, links, and help. A per-session navigation stack restores selection and scroll state when moving back.
-- The global keys are `q` to disconnect, `?` for help, `r` to request revalidation, and Escape or Backspace to return. Lists use Up/Down or `k`/`j`, Page Up/Page Down, `g` for the first row, and `G` for the last loaded row. Enter opens the selected feed entry or activates a thread action. In a comment thread, Left collapses or moves to the parent, Right expands, and Space toggles the selected subtree.
+- The MVP has four visitor-visible views: top feed, the combined Entry and Comment-thread view, primary destination, and help. A per-session navigation stack restores selection and scroll state when moving back.
+- The global keys are `q` or Ctrl+C to disconnect, `?` for help, `r` to request revalidation, and Escape or Backspace to return. Lists use Up/Down or `k`/`j`, Page Up/Page Down, `g` for the first row, and `G` for the last loaded row. Enter opens the selected feed entry or activates a thread action. In a comment thread, Left or `h` collapses or moves to the parent, Right or `l` expands, and Space toggles the selected subtree.
 - The top feed is paged in batches of 30. The current page is fetched progressively with stable placeholders; reaching an explicit “load more” row loads the next batch. HNSSH does not fetch metadata for all top-feed IDs eagerly.
 - The detail view presents all meaningful fields that are actually available. Missing optional fields are omitted. Jobs omit story-only metadata; polls show their options and scores when available; text stories display their text.
-- The links view lists the feed entry's validated top-level URL and links extracted from supported content. HNSSH displays full destinations for copying or terminal-native URL detection. It does not invoke a browser, emit clipboard-control sequences, or claim it can open a browser on the visitor's machine.
+- Validated links extracted from story and comment content remain inline and use OSC 8 terminal hyperlinks; no separate links view is required. The primary destination remains available through `o` as full text for copying or terminal-native URL handling. HNSSH does not invoke a browser or emit clipboard-control sequences.
 - Comment threads preserve every loaded parent-child edge and Hacker News sibling order. Opening a thread loads the first 20 top-level comments. Expanding a comment loads its first 20 direct children, and an explicit row loads subsequent siblings.
 - One browsing session may materialize at most 1,000 comment nodes for one thread and at most 64 levels of depth. The interface displays a limit marker when either cap is reached. Path-based cycle detection and first-occurrence deduplication prevent malformed graphs from looping.
 - Feed, detail, and thread rows distinguish loading, stale, dead, deleted, missing, unsupported, and retryable-failure states where upstream evidence permits the distinction. A local failure never removes already usable sibling content.
@@ -188,7 +188,7 @@ Visitors will navigate with documented keyboard controls, see explicit loading, 
 
 ### Runnable implementation milestones
 
-1. **SSH lifecycle slice:** accept an anonymous connection on an unprivileged development port, require PTY/shell, render one Ratatui screen, handle resize and `q`, and restore the terminal. This introduces Rust ownership, borrowing, traits, async callbacks, and error propagation.
+1. **SSH lifecycle slice:** accept an anonymous connection on an unprivileged development port, require PTY/shell, render one Ratatui screen, handle resize and `q` or Ctrl+C, and restore the terminal. This introduces Rust ownership, borrowing, traits, async callbacks, and error propagation.
 2. **Fixture browsing slice:** browse fixture top-feed entries, details, links, and help over SSH with the final navigation model. This introduces enums, exhaustive matching, per-session state, collections, and pure state transitions.
 3. **Live top-feed slice:** fetch and progressively render the official top feed through the bounded shared cache, including sparse records, retry, stale data, and request coalescing. This introduces Serde, `Result`, shared ownership, futures, semaphores, and cancellation.
 4. **Content slice:** safely normalize story/job/poll text and links and render detail variants. This introduces domain conversion, iterator-based transformations, Unicode handling, and defensive parsing.
@@ -202,7 +202,7 @@ Visitors will navigate with documented keyboard controls, see explicit loading, 
 - The primary functional seam is the one approved for this spec: launch the real HNSSH runtime against a controllable fake Hacker News HTTP endpoint, connect through a real SSH transport, send PTY/input/resize/close events, and inspect the resulting virtual terminal screen. This single high seam covers authentication policy, acquisition, cache behavior, navigation, rendering, output, and browsing-session lifecycle.
 - Functional tests use a terminal emulator/parser to apply ANSI output and assert visible rows, focus, status, and restoration rather than snapshotting raw escape bytes. Assertions target meaningful regions and labels so harmless styling changes do not rewrite the suite.
 - The fake Hacker News endpoint supplies deterministic cases for ordinary link stories, text stories, jobs, polls, absent optional fields, unknown fields/types, HTML and entities, valid and invalid links, deep/wide comments, deleted/dead/null records, cycles, duplicates, reordered siblings, delayed responses, disconnects, malformed JSON, 4xx, 429 with retry guidance, 5xx, and recovery after failure.
-- Core visitor journeys cover connect, top-feed progressive loading, paging, stable selection, details, links, comments, collapse/expand, batched siblings, back-stack restoration, refresh coalescing, stale banners, partial failure, retry, help, minimum-size behavior, resize, idle warning, `q`, and transport loss.
+- Core visitor journeys cover connect, top-feed progressive loading, paging, stable selection, details, links, comments, collapse/expand, batched siblings, back-stack restoration, refresh coalescing, stale banners, partial failure, retry, help, minimum-size behavior, resize, idle warning, `q` or Ctrl+C, and transport loss.
 - SSH policy journeys cover arbitrary supplied usernames with `none` authentication, absent PTY, shell-before/after-resize timing, fragmented/coalesced keys, UTF-8 boundaries, excess input, multiple channels, exec/subsystem/environment/forwarding requests, handshake timeout, channel EOF/close, slow readers, and shutdown during a draw or fetch.
 - Acquisition contract tests run the production HTTP adapter against the fake endpoint and assert request paths, timeout, one-retry policy, status/null/decode classification, unknown-field tolerance, ordering, coalescing, stale windows, and global concurrency. They do not call the live Hacker News interface in the required test suite.
 - Content-safety tests feed hostile HTML, long Unicode, control characters, escape sequences, bidi controls, malformed entities, nested tags, code, and malicious URLs and assert only safe visible text and validated links reach the terminal model.

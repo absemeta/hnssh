@@ -174,6 +174,7 @@ pub struct RichTextStyle {
 pub struct RichTextSpan {
     pub text: String,
     pub style: RichTextStyle,
+    pub link_destination: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,6 +195,7 @@ impl RichText {
                 spans: vec![RichTextSpan {
                     text: value.into(),
                     style: RichTextStyle::default(),
+                    link_destination: None,
                 }],
                 preformatted: false,
             }],

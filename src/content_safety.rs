@@ -38,6 +38,7 @@ pub(crate) fn normalize_html(value: &str) -> NormalizedContent {
             "[content truncated at safety limit]",
             RichTextStyle::default(),
             false,
+            None,
         );
     }
     NormalizedContent {
@@ -96,16 +97,16 @@ fn walk_children<'a>(
     collect_links: bool,
 ) {
     let mut actions = Vec::new();
-    push_children(&mut actions, element, style, preformatted);
+    push_children(&mut actions, element, style, preformatted, None);
 
     while let Some(action) = actions.pop() {
         match action {
-            WalkAction::Text(value, style, preformatted) => {
-                builder.push_text(value, style, preformatted);
+            WalkAction::Text(value, style, preformatted, link_destination) => {
+                builder.push_text(value, style, preformatted, link_destination.as_deref());
             }
             WalkAction::SeparateBlock => builder.separate_block(),
             WalkAction::LineBreak => builder.line_break(),
-            WalkAction::Element(element, mut style, preformatted) => {
+            WalkAction::Element(element, mut style, preformatted, mut link_destination) => {
                 match element.value().name() {
                     "script" | "style" => continue,
                     "br" => {
@@ -118,14 +119,14 @@ fn walk_children<'a>(
                     }
                     "li" => {
                         builder.separate_block();
-                        builder.push_text("• ", style, false);
+                        builder.push_text("• ", style, false, link_destination.as_deref());
                         actions.push(WalkAction::SeparateBlock);
                     }
                     "pre" => {
                         builder.separate_block();
                         style.code = true;
                         actions.push(WalkAction::SeparateBlock);
-                        push_children(&mut actions, element, style, true);
+                        push_children(&mut actions, element, style, true, link_destination);
                         continue;
                     }
                     "em" | "i" => style.emphasis = true,
@@ -137,8 +138,9 @@ fn walk_children<'a>(
                                 if links.len() < MAX_EXTRACTED_LINKS {
                                     let label = normalized_link_label(element)
                                         .unwrap_or_else(|| destination.destination.clone());
-                                    links.push(Link::new(label, destination.destination));
+                                    links.push(Link::new(label, destination.destination.clone()));
                                     style.link = true;
+                                    link_destination = Some(destination.destination);
                                 } else {
                                     *omitted_link_count = omitted_link_count.saturating_add(1);
                                 }
@@ -149,16 +151,16 @@ fn walk_children<'a>(
                     }
                     _ => {}
                 }
-                push_children(&mut actions, element, style, preformatted);
+                push_children(&mut actions, element, style, preformatted, link_destination);
             }
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum WalkAction<'a> {
-    Element(ElementRef<'a>, RichTextStyle, bool),
-    Text(&'a str, RichTextStyle, bool),
+    Element(ElementRef<'a>, RichTextStyle, bool, Option<String>),
+    Text(&'a str, RichTextStyle, bool, Option<String>),
     SeparateBlock,
     LineBreak,
 }
@@ -168,13 +170,24 @@ fn push_children<'a>(
     element: ElementRef<'a>,
     style: RichTextStyle,
     preformatted: bool,
+    link_destination: Option<String>,
 ) {
     for child in element.children().rev() {
         match child.value() {
-            Node::Text(text) => actions.push(WalkAction::Text(text, style, preformatted)),
+            Node::Text(text) => actions.push(WalkAction::Text(
+                text,
+                style,
+                preformatted,
+                link_destination.clone(),
+            )),
             Node::Element(_) => {
                 if let Some(child) = ElementRef::wrap(child) {
-                    actions.push(WalkAction::Element(child, style, preformatted));
+                    actions.push(WalkAction::Element(
+                        child,
+                        style,
+                        preformatted,
+                        link_destination.clone(),
+                    ));
                 }
             }
             Node::Document
@@ -220,30 +233,46 @@ struct RichTextBuilder {
 }
 
 impl RichTextBuilder {
-    fn push_text(&mut self, value: &str, style: RichTextStyle, preformatted: bool) {
+    fn push_text(
+        &mut self,
+        value: &str,
+        style: RichTextStyle,
+        preformatted: bool,
+        link_destination: Option<&str>,
+    ) {
         let value = sanitize_terminal_text(value, preformatted);
         if preformatted {
-            self.push_preformatted(&value, style);
+            self.push_preformatted(&value, style, link_destination);
         } else {
-            self.push_collapsed(&value, style);
+            self.push_collapsed(&value, style, link_destination);
         }
     }
 
-    fn push_collapsed(&mut self, value: &str, style: RichTextStyle) {
+    fn push_collapsed(
+        &mut self,
+        value: &str,
+        style: RichTextStyle,
+        link_destination: Option<&str>,
+    ) {
         for character in value.chars() {
             if character.is_whitespace() {
                 self.pending_space = true;
                 continue;
             }
             if self.pending_space && !self.current_spans.is_empty() {
-                self.push_character(' ', style);
+                self.push_character(' ', style, link_destination);
             }
             self.pending_space = false;
-            self.push_character(character, style);
+            self.push_character(character, style, link_destination);
         }
     }
 
-    fn push_preformatted(&mut self, value: &str, style: RichTextStyle) {
+    fn push_preformatted(
+        &mut self,
+        value: &str,
+        style: RichTextStyle,
+        link_destination: Option<&str>,
+    ) {
         self.pending_space = false;
         self.current_preformatted = true;
         for character in value.chars() {
@@ -251,22 +280,26 @@ impl RichTextBuilder {
                 self.finish_line(true);
                 self.current_preformatted = true;
             } else {
-                self.push_character(character, style);
+                self.push_character(character, style, link_destination);
             }
         }
     }
 
-    fn push_character(&mut self, character: char, style: RichTextStyle) {
-        if let Some(span) = self
-            .current_spans
-            .last_mut()
-            .filter(|span| span.style == style)
-        {
+    fn push_character(
+        &mut self,
+        character: char,
+        style: RichTextStyle,
+        link_destination: Option<&str>,
+    ) {
+        if let Some(span) = self.current_spans.last_mut().filter(|span| {
+            span.style == style && span.link_destination.as_deref() == link_destination
+        }) {
             span.text.push(character);
         } else {
             self.current_spans.push(RichTextSpan {
                 text: character.to_string(),
                 style,
+                link_destination: link_destination.map(str::to_owned),
             });
         }
     }
@@ -432,11 +465,11 @@ mod tests {
                 .iter()
                 .any(|span| span.text.contains('x') && span.style.code)
         );
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.text == "safe" && span.style.link)
-        );
+        assert!(spans.iter().any(|span| {
+            span.text == "safe"
+                && span.style.link
+                && span.link_destination.as_deref() == Some("https://example.com/?a=1&b=2")
+        }));
         assert_eq!(normalized.links.len(), 1);
         assert_eq!(normalized.omitted_link_count, 2);
         assert_eq!(

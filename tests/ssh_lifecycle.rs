@@ -14,8 +14,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use hnssh::{
-    ContentError, ContentSnapshot, ContentSource, FeedEntry, FeedEntryId, FixtureContent,
-    HackerNewsContent, HackerNewsOptions, Server, ServerConfig,
+    Comment, CommentDetails, ContentError, ContentSnapshot, ContentSource, EntryDetails, FeedEntry,
+    FeedEntryId, FixtureContent, HackerNewsContent, HackerNewsOptions, Server, ServerConfig,
 };
 use russh::client;
 use russh::keys::{Algorithm, PrivateKey, ssh_key};
@@ -133,6 +133,165 @@ impl ContentSource for GatedFixtureContent {
             self.fixture.feed_entry(id).await
         })
     }
+}
+
+struct PendingCommentContent {
+    started: Arc<AtomicUsize>,
+    cancelled: Arc<AtomicUsize>,
+}
+
+struct CancellationProbe(Arc<AtomicUsize>);
+
+impl Drop for CancellationProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl ContentSource for PendingCommentContent {
+    fn top_feed(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ContentSnapshot<Vec<FeedEntryId>>, ContentError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(ContentSnapshot::fresh(vec![1])) })
+    }
+
+    fn feed_entry(
+        &self,
+        id: FeedEntryId,
+    ) -> Pin<Box<dyn Future<Output = Result<ContentSnapshot<FeedEntry>, ContentError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            if id != 1 {
+                return Err(ContentError::Unavailable);
+            }
+            Ok(ContentSnapshot::fresh(thread_story(
+                id,
+                "Cancellation story",
+                vec![10],
+            )))
+        })
+    }
+
+    fn comment(
+        &self,
+        _id: FeedEntryId,
+    ) -> Pin<Box<dyn Future<Output = Result<ContentSnapshot<Comment>, ContentError>> + Send + '_>>
+    {
+        let started = Arc::clone(&self.started);
+        let cancelled = Arc::clone(&self.cancelled);
+        Box::pin(async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            let _probe = CancellationProbe(cancelled);
+            std::future::pending::<()>().await;
+            unreachable!("pending comment load only ends by cancellation")
+        })
+    }
+}
+
+struct LimitFixtureContent {
+    requested_comments: Arc<Mutex<Vec<FeedEntryId>>>,
+}
+
+impl LimitFixtureContent {
+    fn request_count(&self, id: FeedEntryId) -> usize {
+        self.requested_comments
+            .lock()
+            .expect("limit fixture request lock")
+            .iter()
+            .filter(|&&requested| requested == id)
+            .count()
+    }
+}
+
+impl ContentSource for LimitFixtureContent {
+    fn top_feed(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ContentSnapshot<Vec<FeedEntryId>>, ContentError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(ContentSnapshot::fresh(vec![1, 2])) })
+    }
+
+    fn feed_entry(
+        &self,
+        id: FeedEntryId,
+    ) -> Pin<Box<dyn Future<Output = Result<ContentSnapshot<FeedEntry>, ContentError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let entry = match id {
+                1 => thread_story(1, "Depth limit story", vec![10_000]),
+                2 => thread_story(2, "Node limit story", (20_000..=21_000).collect()),
+                _ => return Err(ContentError::Unavailable),
+            };
+            Ok(ContentSnapshot::fresh(entry))
+        })
+    }
+
+    fn comment(
+        &self,
+        id: FeedEntryId,
+    ) -> Pin<Box<dyn Future<Output = Result<ContentSnapshot<Comment>, ContentError>> + Send + '_>>
+    {
+        let requested_comments = Arc::clone(&self.requested_comments);
+        Box::pin(async move {
+            requested_comments
+                .lock()
+                .expect("limit fixture request lock")
+                .push(id);
+            let (parent, author, child_ids) = if (10_000..=10_064).contains(&id) {
+                (
+                    if id == 10_000 { 1 } else { id - 1 },
+                    format!("deep-author-{id}"),
+                    if id < 10_064 {
+                        vec![id + 1]
+                    } else {
+                        Vec::new()
+                    },
+                )
+            } else if (20_000..=21_000).contains(&id) {
+                (2, format!("wide-author-{id}"), Vec::new())
+            } else {
+                return Err(ContentError::Unavailable);
+            };
+            Ok(ContentSnapshot::fresh(Comment::Available(CommentDetails {
+                id,
+                parent: Some(parent),
+                author: Some(author),
+                published_at: None,
+                text: None,
+                child_ids,
+                links: Vec::new(),
+                omitted_link_count: 0,
+            })))
+        })
+    }
+}
+
+fn thread_story(id: FeedEntryId, title: &str, comment_ids: Vec<FeedEntryId>) -> FeedEntry {
+    FeedEntry::Story(EntryDetails {
+        id,
+        title: Some(title.to_owned()),
+        source: None,
+        score: None,
+        author: None,
+        published_at: None,
+        comment_count: u32::try_from(comment_ids.len()).ok(),
+        comment_ids,
+        text: None,
+        primary_link: None,
+        links: Vec::new(),
+        omitted_link_count: 0,
+    })
 }
 
 #[derive(Clone)]
@@ -477,7 +636,7 @@ async fn read_through_close(
 }
 
 #[tokio::test]
-async fn visitor_opens_resizes_and_quits_anonymous_screen() -> TestResult {
+async fn visitor_opens_resizes_and_quits_anonymous_screen_with_ctrl_c() -> TestResult {
     let server = TestServer::start().await?;
     let connection = server.connect().await?;
     let mut channel = connection.channel_open_session().await?;
@@ -495,13 +654,13 @@ async fn visitor_opens_resizes_and_quits_anonymous_screen() -> TestResult {
     let screen = terminal.screen().contents();
     assert!(screen.contains("HNSSH"));
     assert!(screen.contains("Top feed"));
-    assert!(screen.contains("q quit"));
+    assert!(screen.contains("q/Ctrl+C quit"));
 
     terminal.screen_mut().set_size(30, 100);
     channel.window_change(100, 30, 0, 0).await?;
     read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Top feed").await?;
 
-    channel.data_bytes(&b"q"[..]).await?;
+    channel.data_bytes(&[0x03][..]).await?;
     let status = read_through_close(&mut channel, &mut raw_output).await?;
     assert_eq!(status, 0);
     assert!(raw_output.windows(4).any(|bytes| bytes == b"\x1b[0m"));
@@ -650,32 +809,17 @@ async fn visitor_browses_fixture_details_links_and_help_without_losing_their_pla
         &mut channel,
         &mut terminal,
         &mut raw_output,
-        "HNSSH · Entry",
+        "Enter load/retry",
     )
     .await?;
     let detail = terminal.screen().contents();
     assert!(detail.contains("Ask HN: What are you building this week?"));
+    assert!(!detail.contains("HNSSH · Entry"));
+    assert!(detail.contains("? help · Enter load/retry · Esc back"));
     assert!(detail.contains("A fixture discussion for trying the detail view."));
     assert!(detail.contains("No comments available."));
     assert!(!detail.contains("View links"));
 
-    channel.data_bytes(&b"l"[..]).await?;
-    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Entry links").await?;
-    assert!(
-        terminal
-            .screen()
-            .contents()
-            .contains("https://doc.rust-lang.org/book/")
-    );
-
-    channel.data_bytes(&[0x7f][..]).await?;
-    read_until_visible(
-        &mut channel,
-        &mut terminal,
-        &mut raw_output,
-        "HNSSH · Entry",
-    )
-    .await?;
     channel.data_bytes(&[0x1b][..]).await?;
     read_until_visible(
         &mut channel,
@@ -698,7 +842,7 @@ async fn visitor_browses_fixture_details_links_and_help_without_losing_their_pla
         &mut channel,
         &mut terminal,
         &mut raw_output,
-        "HNSSH · Entry",
+        "Enter load/retry",
     )
     .await?;
     channel.data_bytes(&[0x1b][..]).await?;
@@ -807,7 +951,7 @@ async fn a_small_terminal_can_open_help_then_resize_into_the_feed() -> TestResul
     let resize = terminal.screen().contents();
     assert!(resize.contains("60 x 16"));
     assert!(resize.contains("? help"));
-    assert!(resize.contains("q quit"));
+    assert!(resize.contains("q/Ctrl+C quit"));
 
     channel.data_bytes(&b"?"[..]).await?;
     read_until_visible(
@@ -985,20 +1129,16 @@ async fn visitor_reads_safe_rich_live_content_and_only_validated_links() -> Test
     assert!(!detail.contains("HIDDEN_STYLE"));
     assert!(detail.contains("Unsafe or malformed links omitted: 2"));
 
-    channel.data_bytes(&b"l"[..]).await?;
-    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Entry links").await?;
-    let links = terminal.screen().contents();
-    assert!(links.contains("https://example.com/story?x=1&y=2"));
     let long_destination = "https://docs.example/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    let compact_links = links
-        .chars()
-        .filter(|character| {
-            !character.is_whitespace() && !matches!(character, '│' | '┌' | '┐' | '└' | '┘' | '─')
-        })
-        .collect::<String>();
-    assert!(compact_links.contains(long_destination));
-    assert!(!links.contains("javascript:"));
-    assert!(!links.contains("visitor:secret"));
+    let osc_start = format!("\x1b]8;;{long_destination}\x1b\\");
+    assert!(
+        raw_output
+            .windows(osc_start.len())
+            .any(|window| window == osc_start.as_bytes()),
+        "inline story link was not emitted as an OSC 8 hyperlink"
+    );
+    assert!(!detail.contains("javascript:"));
+    assert!(!detail.contains("visitor:secret"));
 
     channel.data_bytes(&b"q"[..]).await?;
     assert_eq!(read_through_close(&mut channel, &mut raw_output).await?, 0);
@@ -1821,6 +1961,134 @@ async fn cache_weight_cap_evicts_large_inactive_records() -> TestResult {
 }
 
 #[tokio::test]
+async fn transport_loss_cancels_in_flight_session_comment_loads() -> TestResult {
+    let started = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let content = Arc::new(PendingCommentContent {
+        started: Arc::clone(&started),
+        cancelled: Arc::clone(&cancelled),
+    });
+    let server = TestServer::start_with_content(content).await?;
+    let (connection, mut channel, mut terminal, mut raw_output) = open_terminal(&server).await?;
+
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Cancellation story",
+    )
+    .await?;
+    channel.data_bytes(&b"\r"[..]).await?;
+    timeout(TEST_TIMEOUT, async {
+        while started.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+
+    connection
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "simulate transport loss",
+            "en",
+        )
+        .await?;
+    drop(channel);
+    drop(connection);
+    timeout(TEST_TIMEOUT, async {
+        while cancelled.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+
+    server.stop().await
+}
+
+#[tokio::test]
+async fn visitor_sees_depth_and_node_limit_markers_without_fetching_past_them() -> TestResult {
+    let content = Arc::new(LimitFixtureContent {
+        requested_comments: Arc::new(Mutex::new(Vec::new())),
+    });
+    let server = TestServer::start_with_content(content.clone()).await?;
+    let (connection, mut channel, mut terminal, mut raw_output) = open_terminal(&server).await?;
+
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "Depth limit story",
+    )
+    .await?;
+    channel.data_bytes(&b"\r"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "deep-author-10000",
+    )
+    .await?;
+    for id in 10_001..=10_063 {
+        channel.data_bytes(&b"N"[..]).await?;
+        read_until_visible(
+            &mut channel,
+            &mut terminal,
+            &mut raw_output,
+            &format!("deep-author-{id}"),
+        )
+        .await?;
+    }
+    channel.data_bytes(&b"\x1b[6~"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "[thread depth limit of 64 reached]",
+    )
+    .await?;
+    assert_eq!(content.request_count(10_064), 0);
+
+    channel.data_bytes(&[0x1b][..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Top feed").await?;
+    channel.data_bytes(&b"j\r"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "wide-author-20000",
+    )
+    .await?;
+    let visit_wide_siblings = vec![b'n'; 999];
+    channel.data_bytes(visit_wide_siblings).await?;
+    channel.data_bytes(&b"\x1b[6~"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "[thread node limit of 1000 reached]",
+    )
+    .await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "wide-author-20999",
+    )
+    .await?;
+    assert_eq!(content.request_count(20_999), 1);
+    assert_eq!(content.request_count(21_000), 0);
+
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut raw_output).await?, 0);
+    connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await
+}
+
+#[tokio::test]
 async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> TestResult {
     let mut routes = HashMap::new();
     routes.insert("topstories".to_owned(), vec![FakeReply::json("[1]")]);
@@ -1869,7 +2137,17 @@ async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> 
             r#"{"id":15,"type":"story","title":"Wrong child type"}"#,
         )],
     );
-    for id in 16..=31 {
+    routes.insert(
+        "item/16".to_owned(),
+        vec![
+            FakeReply::json(
+                r#"{"id":16,"type":"comment","parent":1,"by":"stale-author","text":"Stale comment remains readable"}"#,
+            ),
+            FakeReply::status(StatusCode::SERVICE_UNAVAILABLE),
+            FakeReply::status(StatusCode::SERVICE_UNAVAILABLE),
+        ],
+    );
+    for id in 17..=31 {
         let kids = if id == 29 { r#","kids":[290]"# } else { "" };
         routes.insert(
             format!("item/{id}"),
@@ -1898,10 +2176,15 @@ async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> 
     );
 
     let fake = FakeHackerNews::start(routes).await?;
+    let mut options = fast_hacker_news_options();
+    options.comment_fresh_for = Duration::from_millis(10);
+    options.revalidation_interval = Duration::ZERO;
     let content = Arc::new(HackerNewsContent::for_endpoint_with_options(
         fake.endpoint(),
-        fast_hacker_news_options(),
+        options,
     ));
+    content.comment(16).await?;
+    sleep(Duration::from_millis(20)).await;
     let server = TestServer::start_with_content(content).await?;
     let (connection, mut channel, mut terminal, mut raw_output) = open_terminal(&server).await?;
 
@@ -1917,7 +2200,7 @@ async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> 
         &mut channel,
         &mut terminal,
         &mut raw_output,
-        "HNSSH · Entry",
+        "Enter load/retry",
     )
     .await?;
     read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Root & safe").await?;
@@ -1930,6 +2213,14 @@ async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> 
         "[comment temporarily unavailable]",
     )
     .await?;
+    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "stale").await?;
+    timeout(TEST_TIMEOUT, async {
+        while fake.request_count("item/16") < 3 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    assert_eq!(fake.request_count("item/16"), 3);
     assert_eq!(fake.request_count("item/29"), 1);
     assert_eq!(fake.request_count("item/30"), 0);
     assert_eq!(fake.request_count("item/290"), 0);
@@ -1939,6 +2230,8 @@ async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> 
     assert!(collapsed.contains("[dead comment]"));
     assert!(collapsed.contains("[comment missing]"));
     assert!(collapsed.contains("[unsupported story]"));
+    assert!(collapsed.contains("stale-author"));
+    assert!(collapsed.contains("stale"));
     assert!(collapsed.contains("root-author"));
     assert!(!collapsed.contains("Root & safe"));
 
@@ -1975,29 +2268,13 @@ async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> 
     assert!(first_child_header.contains("parent [P]"));
     assert!(first_child_header.contains("next [n]"));
 
-    channel.data_bytes(&b"l"[..]).await?;
-    read_until_visible(
-        &mut channel,
-        &mut terminal,
-        &mut raw_output,
-        "https://comment.example/first",
-    )
-    .await?;
-    assert!(terminal.screen().contents().contains("Comment 100 links"));
-    channel.data_bytes(&[0x1b][..]).await?;
-    read_until_screen_matches(
-        &mut channel,
-        &mut terminal,
-        &mut raw_output,
-        "restored selected nested-a",
-        |screen| {
-            screen
-                .lines()
-                .any(|line| line.contains(">>") && line.contains("nested-a"))
-        },
-    )
-    .await?;
-
+    let osc_start = b"\x1b]8;;https://comment.example/first\x1b\\";
+    assert!(
+        raw_output
+            .windows(osc_start.len())
+            .any(|window| window == osc_start),
+        "inline comment link was not emitted as an OSC 8 hyperlink"
+    );
     channel.data_bytes(&b"n"[..]).await?;
     read_until_screen_matches(
         &mut channel,
@@ -2053,20 +2330,21 @@ async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> 
         .lines()
         .find(|line| line.contains(">>") && line.contains("root-author"))
         .expect("collapsed root remains selected");
+    assert!(root_header.contains("2 comments collapsed"));
     assert!(!root_header.contains("years ago"));
     channel.data_bytes(&b" "[..]).await?;
     read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Nested first").await?;
     assert_eq!(fake.request_count("item/100"), 1);
-    channel.data_bytes(&b"\x1b[D"[..]).await?;
+    channel.data_bytes(&b"h"[..]).await?;
     read_until_screen_matches(
         &mut channel,
         &mut terminal,
         &mut raw_output,
-        "root collapsed with Left",
+        "root collapsed with h",
         |screen| !screen.contains("Nested first") && screen.contains("root-author"),
     )
     .await?;
-    channel.data_bytes(&b"\x1b[C"[..]).await?;
+    channel.data_bytes(&b"l"[..]).await?;
     read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Nested first").await?;
     assert_eq!(fake.request_count("item/100"), 1);
 
@@ -2076,6 +2354,7 @@ async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> 
     assert_eq!(fake.request_count("item/31"), 1);
     assert_eq!(fake.request_count("item/290"), 1);
 
+    let destination_output_start = raw_output.len();
     channel.data_bytes(&b"o"[..]).await?;
     read_until_visible(
         &mut channel,
@@ -2085,6 +2364,18 @@ async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> 
     )
     .await?;
     assert!(terminal.screen().contents().contains("Primary destination"));
+    let destination_output = &raw_output[destination_output_start..];
+    for expected in [
+        b"\x1b]8;;https://example.com/threaded\x1b\\".as_slice(),
+        b"https://example.com/threaded\x1b]8;;\x1b\\".as_slice(),
+    ] {
+        assert!(
+            destination_output
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "destination output did not contain OSC 8 sequence {expected:?}"
+        );
+    }
     channel.data_bytes(&[0x1b][..]).await?;
     read_until_visible(&mut channel, &mut terminal, &mut raw_output, "author-30").await?;
 
@@ -2099,16 +2390,6 @@ async fn visitor_browses_a_lazy_bounded_comment_thread_with_local_failures() -> 
     channel.data_bytes(&[0x1b][..]).await?;
     read_until_visible(&mut channel, &mut terminal, &mut raw_output, "author-30").await?;
 
-    channel.data_bytes(&[0x1b][..]).await?;
-    read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Top feed").await?;
-    channel.data_bytes(&b"l"[..]).await?;
-    read_until_visible(
-        &mut channel,
-        &mut terminal,
-        &mut raw_output,
-        "https://example.com/threaded",
-    )
-    .await?;
     channel.data_bytes(&[0x1b][..]).await?;
     read_until_visible(&mut channel, &mut terminal, &mut raw_output, "Top feed").await?;
     channel.data_bytes(&b"\r"[..]).await?;
@@ -2139,7 +2420,7 @@ async fn long_comment_paging_async_insertion_resize_and_reopen_keep_identity() -
     routes.insert(
         "item/1".to_owned(),
         vec![FakeReply::json(
-            r#"{"id":1,"type":"story","title":"Viewport story","kids":[10,11],"descendants":3}"#,
+            r#"{"id":1,"type":"story","title":"Viewport story","text":"ENTRY-TOP-CONTEXT","kids":[10,11],"descendants":3}"#,
         )],
     );
     routes.insert(
@@ -2215,6 +2496,41 @@ async fn long_comment_paging_async_insertion_resize_and_reopen_keep_identity() -
         &mut terminal,
         &mut raw_output,
         "identity after asynchronous insertion",
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.contains(">>") && line.contains("second-author"))
+        },
+    )
+    .await?;
+
+    channel.data_bytes(&b"p"[..]).await?;
+    read_until_screen_matches(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "selected first root",
+        |screen| {
+            screen
+                .lines()
+                .any(|line| line.contains(">>") && line.contains("long-author"))
+        },
+    )
+    .await?;
+    channel.data_bytes(&b"k"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "ENTRY-TOP-CONTEXT",
+    )
+    .await?;
+    channel.data_bytes(&b"n"[..]).await?;
+    read_until_screen_matches(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "selected second root after returning from Entry top",
         |screen| {
             screen
                 .lines()

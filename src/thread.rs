@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::content::{Comment, CommentId, ContentError, ContentSnapshot, FeedEntryId, Link};
+use crate::content::{Comment, CommentId, ContentError, ContentSnapshot, FeedEntryId};
 use crate::input::Key;
 
 pub(crate) const COMMENT_BATCH_SIZE: usize = 20;
@@ -157,6 +157,12 @@ pub(crate) struct StructuralActions {
     pub(crate) child: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CollapsedComments {
+    pub(crate) count: usize,
+    pub(crate) exact: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CommentThread {
     entry_id: FeedEntryId,
@@ -204,30 +210,22 @@ impl CommentThread {
         self.selected_node
     }
 
+    pub(crate) fn comment_selection_engaged(&self) -> bool {
+        self.selection_engaged
+    }
+
     pub(crate) fn node(&self, index: usize) -> Option<&ThreadNode> {
         self.nodes.get(index)
     }
 
+    #[cfg(test)]
     pub(crate) fn selected_comment_id(&self) -> Option<CommentId> {
+        if !self.selection_engaged {
+            return None;
+        }
         self.selected_node
             .and_then(|node| self.nodes.get(node))
             .map(ThreadNode::id)
-    }
-
-    pub(crate) fn selected_links(&self) -> Option<&[Link]> {
-        let node = self.nodes.get(self.selected_node?)?;
-        match &node.state {
-            ThreadNodeState::Ready(snapshot) => match &snapshot.value {
-                Comment::Available(details) => Some(&details.links),
-                Comment::Deleted { .. }
-                | Comment::Dead { .. }
-                | Comment::Missing { .. }
-                | Comment::Unsupported { .. } => Some(&[]),
-            },
-            ThreadNodeState::Loading
-            | ThreadNodeState::Unavailable
-            | ThreadNodeState::Retryable => Some(&[]),
-        }
     }
 
     pub(crate) fn structural_actions(&self, node: usize) -> StructuralActions {
@@ -244,6 +242,68 @@ impl CommentThread {
             previous: position.is_some_and(|position| position > 0),
             child: comment.has_children(),
         }
+    }
+
+    pub(crate) fn collapsed_comments(&self, node: usize) -> CollapsedComments {
+        fn visit(
+            thread: &CommentThread,
+            node: usize,
+            seen: &mut HashSet<CommentId>,
+            summary: &mut CollapsedComments,
+        ) {
+            let child_ids = match thread.nodes.get(node).map(ThreadNode::state) {
+                Some(ThreadNodeState::Ready(snapshot)) => snapshot.value.child_ids().to_vec(),
+                Some(
+                    ThreadNodeState::Loading
+                    | ThreadNodeState::Unavailable
+                    | ThreadNodeState::Retryable,
+                )
+                | None => {
+                    summary.exact = false;
+                    return;
+                }
+            };
+            let materialized = thread.nodes[node]
+                .children
+                .as_ref()
+                .map(|group| {
+                    group
+                        .edges
+                        .iter()
+                        .filter_map(|edge| match edge {
+                            ThreadEdge::Node(child) => Some((thread.nodes[*child].id(), *child)),
+                            ThreadEdge::Marker(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            for id in child_ids {
+                if !seen.insert(id) {
+                    continue;
+                }
+                summary.count = summary.count.saturating_add(1);
+                if let Some((_, child)) = materialized.iter().find(|(child_id, _)| *child_id == id)
+                {
+                    visit(thread, *child, seen, summary);
+                } else {
+                    summary.exact = false;
+                }
+            }
+        }
+
+        let mut summary = CollapsedComments {
+            count: 0,
+            exact: true,
+        };
+        let mut seen = HashSet::new();
+        if let Some(comment) = self.nodes.get(node) {
+            seen.insert(comment.id());
+            visit(self, node, &mut seen, &mut summary);
+        } else {
+            summary.exact = false;
+        }
+        summary
     }
 
     pub(crate) fn rows(&self) -> Vec<ThreadRow> {
@@ -360,15 +420,18 @@ impl CommentThread {
         }
     }
 
-    pub(crate) fn materialize_near(&mut self, nodes: &[usize]) -> Vec<CommentLoad> {
+    pub(crate) fn materialize_near(&mut self, nodes: &[usize]) -> (bool, Vec<CommentLoad>) {
+        let mut materialized = false;
         let mut loads = Vec::new();
         let mut unique = HashSet::new();
         for &node in nodes {
             if unique.insert(node) && self.nodes.get(node).is_some_and(ThreadNode::expanded) {
-                loads.extend(self.ensure_children(node));
+                let (changed, child_loads) = self.ensure_children(node);
+                materialized |= changed;
+                loads.extend(child_loads);
             }
         }
-        loads
+        (materialized, loads)
     }
 
     pub(crate) fn request_reveal(&mut self) {
@@ -387,9 +450,16 @@ impl CommentThread {
         let previous_row = self.selected_position(&rows);
         let mut loads = Vec::new();
         let mut changed = false;
+        let mut returned_to_entry = false;
 
         match key {
+            Key::Up if !self.selection_engaged => {}
+            Key::Up if previous_row == 0 => {
+                changed = true;
+                returned_to_entry = true;
+            }
             Key::Up => changed = self.move_linear(&rows, -1),
+            Key::Down if !self.selection_engaged && !rows.is_empty() => changed = true,
             Key::Down => changed = self.move_linear(&rows, 1),
             Key::Left => {
                 let Some(node) = self.selected_node else {
@@ -407,8 +477,9 @@ impl CommentThread {
                 let Some(node) = self.selected_node else {
                     return (false, loads);
                 };
-                changed = !self.nodes[node].expanded;
-                loads.extend(self.expand_node(node));
+                let (expanded, child_loads) = self.expand_node(node);
+                changed = expanded;
+                loads.extend(child_loads);
             }
             Key::Toggle => {
                 let Some(node) = self.selected_node else {
@@ -418,7 +489,8 @@ impl CommentThread {
                     self.nodes[node].expanded = false;
                     changed = true;
                 } else {
-                    loads.extend(self.expand_node(node));
+                    let (_, child_loads) = self.expand_node(node);
+                    loads.extend(child_loads);
                     changed = true;
                 }
             }
@@ -474,7 +546,9 @@ impl CommentThread {
                 let Some(node) = self.selected_node else {
                     return (false, loads);
                 };
-                loads.extend(self.expand_node(node));
+                let (expanded, child_loads) = self.expand_node(node);
+                changed = expanded;
+                loads.extend(child_loads);
                 if let Some(child) = self.first_child(node) {
                     self.select_node(child);
                     changed = true;
@@ -513,8 +587,8 @@ impl CommentThread {
         }
 
         if changed || previous_node != self.selected_node || previous_row != self.position() {
-            self.selection_engaged = true;
-            self.reveal_selection = true;
+            self.selection_engaged = !returned_to_entry;
+            self.reveal_selection = !returned_to_entry;
         }
         (changed || !loads.is_empty(), loads)
     }
@@ -619,23 +693,25 @@ impl CommentThread {
             .collect()
     }
 
-    fn expand_node(&mut self, node: usize) -> Vec<CommentLoad> {
+    fn expand_node(&mut self, node: usize) -> (bool, Vec<CommentLoad>) {
+        let expanded = !self.nodes[node].expanded;
         self.nodes[node].expanded = true;
-        self.ensure_children(node)
+        let (materialized, loads) = self.ensure_children(node);
+        (expanded || materialized, loads)
     }
 
-    fn ensure_children(&mut self, node: usize) -> Vec<CommentLoad> {
+    fn ensure_children(&mut self, node: usize) -> (bool, Vec<CommentLoad>) {
         if self.nodes[node].children.is_some() {
-            return Vec::new();
+            return (false, Vec::new());
         }
         let child_ids = match &self.nodes[node].state {
             ThreadNodeState::Ready(snapshot) => snapshot.value.child_ids().to_vec(),
             ThreadNodeState::Loading
             | ThreadNodeState::Unavailable
-            | ThreadNodeState::Retryable => return Vec::new(),
+            | ThreadNodeState::Retryable => return (false, Vec::new()),
         };
         self.nodes[node].children = Some(SiblingGroup::new(child_ids));
-        self.load_group(GroupOwner::Node(node))
+        (true, self.load_group(GroupOwner::Node(node)))
     }
 
     fn load_group(&mut self, owner: GroupOwner) -> Vec<CommentLoad> {
@@ -799,6 +875,28 @@ mod tests {
     }
 
     #[test]
+    fn late_comment_results_cannot_mutate_another_thread_generation() {
+        let (mut thread, loads) = CommentThread::open(10_000, vec![1], 2);
+        thread.set_comment(
+            CommentLoad {
+                generation: 1,
+                ..loads[0]
+            },
+            Ok(available(1, Vec::new())),
+        );
+        assert!(matches!(
+            thread.node(loads[0].node).map(ThreadNode::state),
+            Some(ThreadNodeState::Loading)
+        ));
+
+        thread.set_comment(loads[0], Ok(available(1, Vec::new())));
+        assert!(matches!(
+            thread.node(loads[0].node).map(ThreadNode::state),
+            Some(ThreadNodeState::Ready(_))
+        ));
+    }
+
+    #[test]
     fn repeated_comment_refreshes_are_coalesced_until_the_result_arrives() {
         let (mut thread, loads) = CommentThread::open(10_000, vec![1], 1);
         thread.set_comment(loads[0], Ok(available(1, Vec::new())));
@@ -819,13 +917,33 @@ mod tests {
         thread.set_comment(roots[0], Ok(available(1, vec![3])));
         thread.set_comment(roots[1], Ok(available(2, Vec::new())));
         thread.handle_key(Key::Down);
+        assert_eq!(thread.selected_comment_id(), Some(1));
+        thread.handle_key(Key::Down);
         assert_eq!(thread.selected_comment_id(), Some(2));
 
-        let children = thread.materialize_near(&[roots[0].node]);
+        let (_, children) = thread.materialize_near(&[roots[0].node]);
         thread.set_comment(children[0], Ok(available(3, Vec::new())));
 
         assert_eq!(thread.selected_comment_id(), Some(2));
         assert_eq!(thread.position(), 2);
+    }
+
+    #[test]
+    fn up_from_the_first_comment_returns_to_entry_context() {
+        let (mut thread, roots) = CommentThread::open(10_000, vec![1, 2], 1);
+        thread.set_comment(roots[0], Ok(available(1, Vec::new())));
+        thread.set_comment(roots[1], Ok(available(2, Vec::new())));
+
+        assert!(!thread.comment_selection_engaged());
+        thread.handle_key(Key::Down);
+        assert_eq!(thread.selected_comment_id(), Some(1));
+        thread.handle_key(Key::Down);
+        assert_eq!(thread.selected_comment_id(), Some(2));
+        thread.handle_key(Key::Up);
+        assert_eq!(thread.selected_comment_id(), Some(1));
+        thread.handle_key(Key::Up);
+        assert!(!thread.comment_selection_engaged());
+        assert_eq!(thread.selected_comment_id(), None);
     }
 
     #[test]
@@ -841,6 +959,7 @@ mod tests {
 
         thread.handle_key(Key::NextSibling);
         assert_eq!(thread.selected_comment_id(), Some(4));
+        assert!(!thread.structural_actions(children[1].node).next);
         thread.handle_key(Key::PreviousSibling);
         assert_eq!(thread.selected_comment_id(), Some(3));
         thread.handle_key(Key::Parent);
@@ -850,12 +969,39 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_comment_count_includes_known_descendants() {
+        let (mut thread, roots) = CommentThread::open(10_000, vec![1], 1);
+        thread.set_comment(roots[0], Ok(available(1, vec![2, 3])));
+        assert_eq!(
+            thread.collapsed_comments(roots[0].node),
+            CollapsedComments {
+                count: 2,
+                exact: false,
+            }
+        );
+
+        let (_, children) = thread.materialize_near(&[roots[0].node]);
+        thread.set_comment(children[0], Ok(available(2, vec![4])));
+        thread.set_comment(children[1], Ok(available(3, Vec::new())));
+        let (_, grandchild) = thread.materialize_near(&[children[0].node]);
+        thread.set_comment(grandchild[0], Ok(available(4, Vec::new())));
+
+        assert_eq!(
+            thread.collapsed_comments(roots[0].node),
+            CollapsedComments {
+                count: 3,
+                exact: true,
+            }
+        );
+    }
+
+    #[test]
     fn depth_and_materialized_node_limits_end_with_visible_markers() {
         let (mut deep, mut loads) = CommentThread::open(10_000, vec![1], 1);
         for id in 1..=MAX_THREAD_DEPTH {
             let load = loads.pop().expect("one comment at each permitted depth");
             deep.set_comment(load, Ok(available(id as u64, vec![id as u64 + 1])));
-            loads = deep.expand_node(load.node);
+            loads = deep.expand_node(load.node).1;
         }
         assert!(loads.is_empty());
         assert_eq!(deep.nodes.len(), MAX_THREAD_DEPTH);

@@ -291,6 +291,7 @@ struct SessionActor {
     size: TerminalSize,
     source: Arc<dyn ContentSource>,
     item_limit: Arc<Semaphore>,
+    load_tasks: JoinSet<()>,
     browser: Browser,
     terminal: RemoteTerminal,
     output: OutputBuffer,
@@ -318,6 +319,7 @@ impl SessionActor {
             size,
             source,
             item_limit: Arc::new(Semaphore::new(PAGE_ITEM_CONCURRENCY)),
+            load_tasks: JoinSet::new(),
             browser: Browser::new(),
             terminal,
             output,
@@ -333,7 +335,25 @@ impl SessionActor {
         self.redraw(&event_sender).await?;
         self.load_top_feed(event_sender.clone(), ContentUpdate::Initial);
 
-        while let Some(event) = events.recv().await {
+        loop {
+            let event = if self.load_tasks.is_empty() {
+                events.recv().await
+            } else {
+                tokio::select! {
+                    event = events.recv() => event,
+                    joined = self.load_tasks.join_next() => {
+                        if let Some(Err(error)) = joined
+                            && !error.is_cancelled()
+                        {
+                            debug!(%error, "session content task failed");
+                        }
+                        continue;
+                    }
+                }
+            };
+            let Some(event) = event else {
+                break;
+            };
             match event {
                 ActorEvent::TopFeed { result, update } => {
                     let revalidate = needs_background_revalidation(&result, update);
@@ -426,9 +446,9 @@ impl SessionActor {
         Ok(())
     }
 
-    fn load_top_feed(&self, events: UnboundedSender<ActorEvent>, update: ContentUpdate) {
+    fn load_top_feed(&mut self, events: UnboundedSender<ActorEvent>, update: ContentUpdate) {
         let source = Arc::clone(&self.source);
-        tokio::spawn(async move {
+        self.load_tasks.spawn(async move {
             let result = match update {
                 ContentUpdate::Initial => source.top_feed().await,
                 ContentUpdate::Revalidation => source.refresh_top_feed().await,
@@ -438,7 +458,7 @@ impl SessionActor {
     }
 
     fn load_entries(
-        &self,
+        &mut self,
         entries: Vec<FeedEntryLoad>,
         events: &UnboundedSender<ActorEvent>,
         update: ContentUpdate,
@@ -449,7 +469,7 @@ impl SessionActor {
     }
 
     fn load_entry(
-        &self,
+        &mut self,
         entry: FeedEntryLoad,
         events: UnboundedSender<ActorEvent>,
         update: ContentUpdate,
@@ -457,7 +477,7 @@ impl SessionActor {
         let FeedEntryLoad { index, id } = entry;
         let source = Arc::clone(&self.source);
         let item_limit = Arc::clone(&self.item_limit);
-        tokio::spawn(async move {
+        self.load_tasks.spawn(async move {
             let permit = match item_limit.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -484,16 +504,16 @@ impl SessionActor {
         });
     }
 
-    fn load_comments(&self, loads: Vec<CommentLoad>, events: &UnboundedSender<ActorEvent>) {
+    fn load_comments(&mut self, loads: Vec<CommentLoad>, events: &UnboundedSender<ActorEvent>) {
         for load in loads {
             self.load_comment(load, events.clone());
         }
     }
 
-    fn load_comment(&self, load: CommentLoad, events: UnboundedSender<ActorEvent>) {
+    fn load_comment(&mut self, load: CommentLoad, events: UnboundedSender<ActorEvent>) {
         let source = Arc::clone(&self.source);
         let item_limit = Arc::clone(&self.item_limit);
-        tokio::spawn(async move {
+        self.load_tasks.spawn(async move {
             let permit = match item_limit.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -519,7 +539,11 @@ impl SessionActor {
     ) -> Result<(), ActorError> {
         let candidates = self.render().await?;
         let mut loads = self.browser.take_comment_loads();
-        loads.extend(self.browser.materialize_current_comments(&candidates));
+        let (materialized, nearby_loads) = self.browser.materialize_current_comments(&candidates);
+        loads.extend(nearby_loads);
+        if materialized {
+            self.render().await?;
+        }
         self.load_comments(loads, event_sender);
         Ok(())
     }
@@ -527,18 +551,21 @@ impl SessionActor {
     async fn render(&mut self) -> Result<Vec<usize>, ActorError> {
         let browser = &mut self.browser;
         let size = self.size.area();
-        let mut candidates = Vec::new();
+        let mut rendered = ui::RenderOutput::default();
         self.terminal.draw(|frame| {
-            candidates = ui::render(frame, browser, size);
+            rendered = ui::render(frame, browser, size);
         })?;
-        let output = self.output.take()?;
+        let mut output = self.output.take()?;
+        for hyperlink in &rendered.hyperlinks {
+            append_terminal_hyperlink(&mut output, hyperlink);
+        }
         if !output.is_empty() {
             self.handle
                 .data(self.channel, output)
                 .await
                 .map_err(|_| ActorError::OutputClosed)?;
         }
-        Ok(candidates)
+        Ok(rendered.comment_candidates)
     }
 
     async fn finish(&mut self) {
@@ -547,6 +574,20 @@ impl SessionActor {
         let _ = self.handle.eof(self.channel).await;
         let _ = self.handle.close(self.channel).await;
     }
+}
+
+fn append_terminal_hyperlink(output: &mut Vec<u8>, hyperlink: &ui::TerminalHyperlink) {
+    let position = format!(
+        "\x1b[{};{}H",
+        hyperlink.row.saturating_add(1),
+        hyperlink.column.saturating_add(1)
+    );
+    output.extend_from_slice(position.as_bytes());
+    output.extend_from_slice(b"\x1b]8;;");
+    output.extend_from_slice(hyperlink.destination.as_bytes());
+    output.extend_from_slice(b"\x1b\\\x1b[34;4m");
+    output.extend_from_slice(hyperlink.text.as_bytes());
+    output.extend_from_slice(b"\x1b]8;;\x1b\\\x1b[0m");
 }
 
 fn spawn_session_actor(
@@ -828,6 +869,25 @@ mod tests {
                 columns: MAX_COLUMNS,
                 rows: MAX_ROWS,
             }
+        );
+    }
+
+    #[test]
+    fn terminal_hyperlink_uses_osc_8_and_one_based_coordinates() {
+        let mut output = Vec::new();
+        append_terminal_hyperlink(
+            &mut output,
+            &ui::TerminalHyperlink {
+                column: 1,
+                row: 3,
+                text: "https://example.com/story".to_owned(),
+                destination: "https://example.com/story".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            output,
+            b"\x1b[4;2H\x1b]8;;https://example.com/story\x1b\\\x1b[34;4mhttps://example.com/story\x1b]8;;\x1b\\\x1b[0m"
         );
     }
 }
