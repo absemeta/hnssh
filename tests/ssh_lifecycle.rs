@@ -21,7 +21,9 @@ use russh::client;
 use russh::keys::{Algorithm, PrivateKey, ssh_key};
 use russh::{Channel, ChannelMsg, client::AuthResult};
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::{Semaphore, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +32,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 struct TrustExpectedHostKey {
     expected: ssh_key::PublicKey,
+    disconnected: Option<oneshot::Sender<String>>,
 }
 
 impl client::Handler for TrustExpectedHostKey {
@@ -40,6 +43,20 @@ impl client::Handler for TrustExpectedHostKey {
         server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(server_public_key == &self.expected)
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        let message = match reason {
+            client::DisconnectReason::ReceivedDisconnect(info) => info.message,
+            client::DisconnectReason::Error(error) => format!("transport error: {error}"),
+        };
+        if let Some(sender) = self.disconnected.take() {
+            let _ = sender.send(message);
+        }
+        Ok(())
     }
 }
 
@@ -79,15 +96,25 @@ impl TestServer {
         })
     }
 
-    async fn connect(&self) -> TestResult<client::Handle<TrustExpectedHostKey>> {
-        let config = Arc::new(client::Config {
-            inactivity_timeout: Some(TEST_TIMEOUT),
-            ..Default::default()
-        });
+    async fn connect_unauthenticated(
+        &self,
+    ) -> TestResult<(
+        client::Handle<TrustExpectedHostKey>,
+        oneshot::Receiver<String>,
+    )> {
+        let config = Arc::new(client::Config::default());
+        let (sender, disconnected) = oneshot::channel();
         let handler = TrustExpectedHostKey {
             expected: self.public_key.clone(),
+            disconnected: Some(sender),
         };
-        let mut connection = client::connect(config, self.address, handler).await?;
+        let connection =
+            timeout(TEST_TIMEOUT, client::connect(config, self.address, handler)).await??;
+        Ok((connection, disconnected))
+    }
+
+    async fn connect(&self) -> TestResult<client::Handle<TrustExpectedHostKey>> {
+        let (mut connection, _) = self.connect_unauthenticated().await?;
         let result: AuthResult = connection.authenticate_none("ignored-visitor-name").await?;
         assert!(result.success(), "none authentication should succeed");
         Ok(connection)
@@ -2621,6 +2648,565 @@ async fn long_comment_paging_async_insertion_resize_and_reopen_keep_identity() -
     fake.stop().await
 }
 
+async fn expect_failure(channel: &mut Channel<client::Msg>) -> TestResult {
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Failure) => return Ok(()),
+                Some(ChannelMsg::Data { .. }) | Some(ChannelMsg::WindowAdjusted { .. }) => {}
+                message => return Err(format!("expected request failure, got {message:?}").into()),
+            }
+        }
+    })
+    .await?
+}
+
+fn assert_channel_denied(result: Result<Channel<client::Msg>, russh::Error>) {
+    assert!(
+        matches!(
+            result,
+            Err(russh::Error::ChannelOpenFailure(
+                russh::ChannelOpenFailure::AdministrativelyProhibited
+            ))
+        ),
+        "expected administrative channel rejection, got {result:?}"
+    );
+}
+
+async fn reject_unsupported_requests(channel: &mut Channel<client::Msg>) -> TestResult {
+    channel
+        .exec(true, "touch /tmp/hnssh-must-not-execute")
+        .await?;
+    expect_failure(channel).await?;
+    channel.request_subsystem(true, "sftp").await?;
+    expect_failure(channel).await?;
+    channel.set_env(true, "PATH", "/tmp").await?;
+    expect_failure(channel).await?;
+    channel
+        .request_x11(true, false, "MIT-MAGIC-COOKIE-1", "0123456789abcdef", 0)
+        .await?;
+    expect_failure(channel).await?;
+    channel.agent_forward(true).await?;
+    expect_failure(channel).await?;
+    // No-reply requests must not leave stray success/failure replies that could
+    // be mistaken for the next (valid) request's acknowledgement.
+    channel.exec(false, "sh").await?;
+    channel.request_subsystem(false, "sftp").await?;
+    channel.set_env(false, "TERM", "dumb").await?;
+    channel
+        .request_x11(false, false, "MIT-MAGIC-COOKIE-1", "bad-cookie", 0)
+        .await?;
+    channel.agent_forward(false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_and_unsupported_requests_preserve_the_browsing_session() -> TestResult {
+    let server = TestServer::start().await?;
+    let connection = server.connect().await?;
+    let mut channel = connection.channel_open_session().await?;
+    assert_channel_denied(timeout(TEST_TIMEOUT, connection.channel_open_session()).await?);
+    reject_unsupported_requests(&mut channel).await?;
+
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await?;
+    expect_success(&mut channel).await?;
+    channel.request_pty(true, "xterm", 1, 1, 0, 0, &[]).await?;
+    expect_failure(&mut channel).await?;
+    channel.request_shell(true).await?;
+    expect_success(&mut channel).await?;
+    let mut terminal = vt100::Parser::new(24, 80, 0);
+    let mut output = Vec::new();
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+
+    channel.request_shell(true).await?;
+    expect_failure(&mut channel).await?;
+    channel.request_pty(true, "xterm", 1, 1, 0, 0, &[]).await?;
+    expect_failure(&mut channel).await?;
+    reject_unsupported_requests(&mut channel).await?;
+    assert_channel_denied(timeout(TEST_TIMEOUT, connection.channel_open_session()).await?);
+    assert_channel_denied(
+        timeout(
+            TEST_TIMEOUT,
+            connection.channel_open_direct_tcpip("127.0.0.1", 22, "127.0.0.1", 1234),
+        )
+        .await?,
+    );
+    assert_channel_denied(
+        timeout(TEST_TIMEOUT, connection.channel_open_x11("127.0.0.1", 6000)).await?,
+    );
+    assert_channel_denied(
+        timeout(
+            TEST_TIMEOUT,
+            connection.channel_open_direct_streamlocal("/tmp/hnssh-not-a-socket"),
+        )
+        .await?,
+    );
+    assert!(matches!(
+        timeout(TEST_TIMEOUT, connection.tcpip_forward("127.0.0.1", 0)).await?,
+        Err(russh::Error::RequestDenied)
+    ));
+    assert!(matches!(
+        timeout(
+            TEST_TIMEOUT,
+            connection.cancel_tcpip_forward("127.0.0.1", 1234)
+        )
+        .await?,
+        Err(russh::Error::RequestDenied)
+    ));
+    assert!(matches!(
+        timeout(
+            TEST_TIMEOUT,
+            connection.streamlocal_forward("/tmp/hnssh-not-a-socket")
+        )
+        .await?,
+        Err(russh::Error::RequestDenied)
+    ));
+    assert!(matches!(
+        timeout(
+            TEST_TIMEOUT,
+            connection.cancel_streamlocal_forward("/tmp/hnssh-not-a-socket")
+        )
+        .await?,
+        Err(russh::Error::RequestDenied)
+    ));
+
+    channel.data_bytes(&b"j"[..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut output, "> 2. Ask HN:").await?;
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 0);
+    // The one-channel limit is per connection, not merely concurrently open channels.
+    assert_channel_denied(timeout(TEST_TIMEOUT, connection.channel_open_session()).await?);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn forwarding_agent_forwarding_rejections_do_not_cross_request_scopes() -> TestResult {
+    let server = TestServer::start().await?;
+    let (connection, mut channel, mut terminal, mut output) = open_terminal(&server).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+
+    for agent_wants_reply in [true, false] {
+        // Leave a replied-to global request before the channel request. Pipeline
+        // the next global request so a stray reply cannot be silently discarded.
+        assert!(matches!(
+            timeout(TEST_TIMEOUT, connection.tcpip_forward("127.0.0.1", 0)).await?,
+            Err(russh::Error::RequestDenied)
+        ));
+        channel.agent_forward(agent_wants_reply).await?;
+        let result = timeout(TEST_TIMEOUT, connection.tcpip_forward("127.0.0.1", 0)).await?;
+        assert!(
+            matches!(result, Err(russh::Error::RequestDenied)),
+            "forwarding after agent rejection: {result:?}"
+        );
+        if agent_wants_reply {
+            expect_failure(&mut channel).await?;
+        }
+        channel.request_shell(true).await?;
+        expect_failure(&mut channel).await?;
+    }
+
+    channel.data_bytes(&b"j"[..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut output, "> 2. Ask HN:").await?;
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 0);
+    server.stop().await
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NoReplyForwarding {
+    None,
+    Tcp,
+    CancelTcp,
+    Unix,
+    CancelUnix,
+}
+
+struct OrderedForwardingReply {
+    arrived_before_marker: bool,
+    reply: oneshot::Receiver<Option<u32>>,
+}
+
+struct ForwardingOrderClient {
+    expected_key: ssh_key::PublicKey,
+    no_reply: NoReplyForwarding,
+    agent_wants_reply: bool,
+    later_reply: Option<oneshot::Receiver<Option<u32>>>,
+    observed: Option<oneshot::Sender<OrderedForwardingReply>>,
+}
+
+impl client::Handler for ForwardingOrderClient {
+    type Error = russh::Error;
+
+    async fn check_server_key(&mut self, key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
+        Ok(key == &self.expected_key)
+    }
+
+    async fn channel_open_confirmation(
+        &mut self,
+        channel: russh::ChannelId,
+        _max_packet_size: u32,
+        _window_size: u32,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        // Session's public API supports no-reply global requests; Handle's does
+        // not. Queue one batch in wire order, without timers or server hooks.
+        match self.no_reply {
+            // Preserve the preceding replied-to global request's state, then
+            // interleave agent -> marker -> global in one deterministic batch.
+            NoReplyForwarding::None => {}
+            NoReplyForwarding::Tcp => session.tcpip_forward(None, "127.0.0.1", 0)?,
+            NoReplyForwarding::CancelTcp => {
+                session.cancel_tcpip_forward(None, "127.0.0.1", 1234)?
+            }
+            NoReplyForwarding::Unix => {
+                session.streamlocal_forward(None, "/tmp/hnssh-not-a-socket")?
+            }
+            NoReplyForwarding::CancelUnix => {
+                session.cancel_streamlocal_forward(None, "/tmp/hnssh-not-a-socket")?
+            }
+        }
+        session.agent_forward(channel, self.agent_wants_reply)?;
+        // The PTY success is a wire-order marker before the next global reply.
+        session.request_pty(channel, true, "xterm", 80, 24, 0, 0, &[])?;
+        let (sender, receiver) = oneshot::channel();
+        session.tcpip_forward(Some(sender), "127.0.0.1", 0)?;
+        self.later_reply = Some(receiver);
+        Ok(())
+    }
+
+    async fn channel_success(
+        &mut self,
+        _channel: russh::ChannelId,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(mut reply) = self.later_reply.take() {
+            let arrived_before_marker =
+                !matches!(reply.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+            if let Some(observed) = self.observed.take() {
+                let _ = observed.send(OrderedForwardingReply {
+                    arrived_before_marker,
+                    reply,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn no_reply_forwarding_and_agent_requests_do_not_emit_unsolicited_replies() -> TestResult {
+    let server = TestServer::start().await?;
+    for no_reply in [
+        NoReplyForwarding::None,
+        NoReplyForwarding::Tcp,
+        NoReplyForwarding::CancelTcp,
+        NoReplyForwarding::Unix,
+        NoReplyForwarding::CancelUnix,
+    ] {
+        for agent_wants_reply in [false, true] {
+            let (observed, observation) = oneshot::channel();
+            let handler = ForwardingOrderClient {
+                expected_key: server.public_key.clone(),
+                no_reply,
+                agent_wants_reply,
+                later_reply: None,
+                observed: Some(observed),
+            };
+            let mut connection = timeout(
+                TEST_TIMEOUT,
+                client::connect(Arc::new(client::Config::default()), server.address, handler),
+            )
+            .await??;
+            assert!(connection.authenticate_none("visitor").await?.success());
+            // Start with a replied-to global request, as in the original bug.
+            assert!(matches!(
+                timeout(TEST_TIMEOUT, connection.tcpip_forward("127.0.0.1", 0)).await?,
+                Err(russh::Error::RequestDenied)
+            ));
+            let mut channel = timeout(TEST_TIMEOUT, connection.channel_open_session()).await??;
+            if agent_wants_reply {
+                expect_failure(&mut channel).await?;
+            }
+            // An unsolicited channel failure (including for agent want_reply=false)
+            // cannot masquerade as the expected successful PTY acknowledgement.
+            expect_success(&mut channel).await?;
+            let observed = timeout(TEST_TIMEOUT, observation)
+                .await
+                .map_err(|_| "no PTY marker observation")??;
+            assert!(
+                !observed.arrived_before_marker,
+                "unsolicited global reply for {no_reply:?}, agent want_reply={agent_wants_reply}"
+            );
+            assert_eq!(
+                timeout(TEST_TIMEOUT, observed.reply)
+                    .await
+                    .map_err(|_| "no global forwarding reply after marker")??,
+                None
+            );
+
+            channel.request_shell(true).await?;
+            expect_success(&mut channel).await?;
+            let mut terminal = vt100::Parser::new(24, 80, 0);
+            let mut output = Vec::new();
+            read_until_visible(
+                &mut channel,
+                &mut terminal,
+                &mut output,
+                "Rust reaches the tiny terminal",
+            )
+            .await?;
+            channel.data_bytes(&b"j"[..]).await?;
+            read_until_visible(&mut channel, &mut terminal, &mut output, "> 2. Ask HN:").await?;
+            channel.data_bytes(&b"q"[..]).await?;
+            assert_eq!(read_through_close(&mut channel, &mut output).await?, 0);
+        }
+    }
+    server.stop().await
+}
+
+#[tokio::test]
+async fn data_and_resize_before_pty_do_not_establish_or_mutate_a_shell() -> TestResult {
+    let server = TestServer::start().await?;
+    let connection = server.connect().await?;
+    let mut channel = connection.channel_open_session().await?;
+    channel.data_bytes(&b"qjj"[..]).await?;
+    channel.window_change(1, 1, 0, 0).await?;
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await?;
+    expect_success(&mut channel).await?;
+    // A resize after PTY but before shell is legal and must not count as a PTY.
+    channel.window_change(100, 30, 0, 0).await?;
+    channel.request_shell(true).await?;
+    expect_success(&mut channel).await?;
+    let mut terminal = vt100::Parser::new(30, 100, 0);
+    let mut output = Vec::new();
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "> 1. Rust reaches the tiny terminal",
+    )
+    .await?;
+    assert!(!terminal.screen().contents().contains("Terminal too small"));
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 0);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn eof_during_setup_prevents_later_pty_or_shell_acceptance() -> TestResult {
+    let server = TestServer::start().await?;
+    for with_pty in [false, true] {
+        let connection = server.connect().await?;
+        let mut channel = connection.channel_open_session().await?;
+        if with_pty {
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await?;
+            expect_success(&mut channel).await?;
+        }
+        channel.eof().await?;
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await?;
+        expect_failure(&mut channel).await?;
+        channel.request_shell(true).await?;
+        expect_failure(&mut channel).await?;
+        assert_channel_denied(timeout(TEST_TIMEOUT, connection.channel_open_session()).await?);
+    }
+    server.stop().await
+}
+
+#[tokio::test]
+async fn setup_deadline_starts_at_authentication_and_is_not_extended_by_requests() -> TestResult {
+    let server = TestServer::start().await?;
+    let (mut connection, disconnected) = server.connect_unauthenticated().await?;
+    sleep(Duration::from_secs(6)).await;
+    assert!(connection.authenticate_none("visitor").await?.success());
+    let authenticated_at = Instant::now();
+    sleep(Duration::from_secs(6)).await;
+    // More than ten seconds since connection, but still inside the setup budget.
+    let mut channel = connection.channel_open_session().await?;
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await?;
+    expect_success(&mut channel).await?;
+    channel.exec(true, "sh").await?;
+    expect_failure(&mut channel).await?;
+    let reason = timeout(Duration::from_secs(7), disconnected).await??;
+    assert!(reason.contains("ssh -t"), "unexpected disconnect: {reason}");
+    assert!(authenticated_at.elapsed() >= Duration::from_secs(9));
+    assert!(authenticated_at.elapsed() < Duration::from_secs(13));
+    server.stop().await
+}
+
+#[tokio::test]
+async fn setup_deadlines_cover_no_channel_no_pty_and_no_shell_without_harming_browsers()
+-> TestResult {
+    let server = TestServer::start().await?;
+    let (_healthy, mut browsing, mut terminal, mut output) = open_terminal(&server).await?;
+    read_until_visible(
+        &mut browsing,
+        &mut terminal,
+        &mut output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+    let mut pending = Vec::new();
+    let started = Instant::now();
+    for stage in 0..3 {
+        let (mut connection, disconnected) = server.connect_unauthenticated().await?;
+        assert!(connection.authenticate_none("visitor").await?.success());
+        let channel = if stage > 0 {
+            let mut channel = connection.channel_open_session().await?;
+            if stage == 2 {
+                channel
+                    .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                    .await?;
+                expect_success(&mut channel).await?;
+            }
+            Some(channel)
+        } else {
+            None
+        };
+        pending.push((connection, channel, disconnected));
+    }
+    // All three expire concurrently at the production deadline. Keeping their
+    // handles/channels alive ensures client teardown is not the cause of closure.
+    for (connection, _channel, disconnected) in pending {
+        let reason = timeout(Duration::from_secs(15), disconnected).await??;
+        assert!(
+            reason.contains("PTY and shell"),
+            "unexpected disconnect: {reason}"
+        );
+        assert!(reason.contains("ssh -t"));
+        assert!(connection.is_closed());
+    }
+    assert!(started.elapsed() >= Duration::from_secs(9));
+    assert!(started.elapsed() < Duration::from_secs(15));
+    // A successfully established shell is not subject to the setup deadline.
+    browsing.data_bytes(&b"j"[..]).await?;
+    read_until_visible(&mut browsing, &mut terminal, &mut output, "> 2. Ask HN:").await?;
+    browsing.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut browsing, &mut output).await?, 0);
+    server.stop().await
+}
+
+async fn expect_transport_closed(stream: &mut TcpStream) -> TestResult {
+    let mut bytes = [0; 4096];
+    loop {
+        match stream.read(&mut bytes).await {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn handshake_deadline_covers_stalled_identification_key_exchange_and_authentication()
+-> TestResult {
+    let server = TestServer::start().await?;
+    let started = Instant::now();
+    let mut silent = TcpStream::connect(server.address).await?;
+    let mut stalled_kex = TcpStream::connect(server.address).await?;
+    stalled_kex.write_all(b"SSH-2.0-hnssh-test\r\n").await?;
+    let (_unauthenticated, disconnected) = server.connect_unauthenticated().await?;
+    timeout(Duration::from_secs(15), async {
+        expect_transport_closed(&mut silent).await?;
+        expect_transport_closed(&mut stalled_kex).await?;
+        let reason = disconnected.await?;
+        assert!(
+            reason.contains("handshake timed out"),
+            "unexpected disconnect: {reason}"
+        );
+        assert!(reason.contains("Reconnect"));
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .await??;
+    assert!(started.elapsed() >= Duration::from_secs(9));
+    // One connection's handshake expiry does not stop acceptance.
+    let (_connection, mut channel, mut terminal, mut output) = open_terminal(&server).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut output, "Top feed").await?;
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 0);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn shutdown_closes_connections_at_every_setup_stage_without_waiting_for_deadlines()
+-> TestResult {
+    let server = TestServer::start().await?;
+    let mut silent = TcpStream::connect(server.address).await?;
+    let mut stalled_kex = TcpStream::connect(server.address).await?;
+    stalled_kex.write_all(b"SSH-2.0-hnssh-test\r\n").await?;
+    let (_unauthenticated, unauthenticated_closed) = server.connect_unauthenticated().await?;
+    let (mut authenticated, authenticated_closed) = server.connect_unauthenticated().await?;
+    assert!(authenticated.authenticate_none("visitor").await?.success());
+    let (mut with_pty, pty_closed) = server.connect_unauthenticated().await?;
+    assert!(with_pty.authenticate_none("visitor").await?.success());
+    let mut channel = with_pty.channel_open_session().await?;
+    channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await?;
+    expect_success(&mut channel).await?;
+
+    timeout(TEST_TIMEOUT, async {
+        server.stop().await?;
+        expect_transport_closed(&mut silent).await?;
+        expect_transport_closed(&mut stalled_kex).await?;
+        for closed in [unauthenticated_closed, authenticated_closed, pty_closed] {
+            assert!(closed.await?.contains("shutting down"));
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelling_the_server_future_closes_setup_transports() -> TestResult {
+    let server = TestServer::start().await?;
+    let mut silent = TcpStream::connect(server.address).await?;
+    let mut stalled_kex = TcpStream::connect(server.address).await?;
+    stalled_kex.write_all(b"SSH-2.0-hnssh-test\r\n").await?;
+    let (mut connection, disconnected) = server.connect_unauthenticated().await?;
+    assert!(connection.authenticate_none("visitor").await?.success());
+    server.task.abort();
+    assert!(server.task.await.unwrap_err().is_cancelled());
+    timeout(TEST_TIMEOUT, async {
+        expect_transport_closed(&mut silent).await?;
+        expect_transport_closed(&mut stalled_kex).await?;
+        disconnected.await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn shell_without_a_pty_gets_reconnection_help() -> TestResult {
     let server = TestServer::start().await?;
@@ -2636,6 +3222,8 @@ async fn shell_without_a_pty_gets_reconnection_help() -> TestResult {
     let output = String::from_utf8(raw_output)?;
     assert!(output.contains("HNSSH requires an interactive terminal"));
     assert!(output.contains("ssh -t <hostname>"));
+    assert!(!output.contains("\x1b[?1049h"));
+    assert_channel_denied(timeout(TEST_TIMEOUT, connection.channel_open_session()).await?);
 
     connection
         .disconnect(russh::Disconnect::ByApplication, "test complete", "en")

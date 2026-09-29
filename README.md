@@ -33,6 +33,10 @@ The SSH client's first-connection host-authenticity prompt verifies the server a
 
 A client must request an interactive PTY. If automatic PTY allocation is unavailable, reconnect with `ssh -t` (or `ssh -tt` when the client's standard input is not a terminal).
 
+Each connection permits one session channel, one PTY, and one shell request. Commands, subsystems, environment changes, agent/X11 forwarding, and TCP/Unix-socket forwarding are rejected. Identification, key exchange, and authentication have a ten-second deadline; authenticated clients then have ten seconds to establish the PTY and shell. Established browsing sessions are not subject to those setup deadlines.
+
+Russh is pinned with a narrow local protocol-reply patch; see [`vendor/russh/PATCHES.md`](vendor/russh/PATCHES.md) for provenance and the upgrade/removal checklist.
+
 ## Verify
 
 ```sh

@@ -12,10 +12,10 @@ use russh::server::{self, Auth, Handler, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect, MethodSet, Pty};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::timeout;
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -35,6 +35,12 @@ const DEFAULT_SESSION_SIZE: TerminalSize = TerminalSize {
 const MAX_COLUMNS: u16 = 300;
 const MAX_ROWS: u16 = 120;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT_REASON: &str =
+    "HNSSH handshake timed out. Reconnect with an SSH client and authenticate within 10 seconds.";
+const SETUP_TIMEOUT_REASON: &str =
+    "HNSSH requires a PTY and shell within 10 seconds. Reconnect with: ssh -t <hostname>";
 const TOP_FEED_PAGE_SIZE: usize = 30;
 const PAGE_ITEM_CONCURRENCY: usize = 8;
 const ENTER_SCREEN: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l";
@@ -189,21 +195,81 @@ async fn run_connection(
     content: Arc<dyn ContentSource>,
     shutdown: CancellationToken,
 ) -> Result<(), SessionError> {
-    let running = server::run_stream(config, stream, BrowsingSession::new(content)).await?;
+    let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    // run_stream only exchanges identification before spawning russh's task; dropping
+    // RunningSession detaches that task. Keep a shutdown guard for cancellation and
+    // stalled writes, including when Server::run aborts its connection tasks.
+    let socket = stream.into_std()?;
+    let transport = CloseTransport(socket.try_clone()?);
+    let stream = TcpStream::from_std(socket)?;
+    let (progress, mut changes) = watch::channel(SetupProgress::Authenticating);
+    let running = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return Ok(()),
+        result = timeout_at(handshake_deadline, server::run_stream(
+            config, stream, BrowsingSession::new(content, progress),
+        )) => match result {
+            Ok(result) => result?,
+            // Before identification/key exchange there is no usable encrypted channel.
+            Err(_) => return Ok(()),
+        },
+    };
     let handle = running.handle();
     tokio::pin!(running);
 
-    tokio::select! {
-        result = &mut running => result,
-        _ = shutdown.cancelled() => {
-            handle.disconnect(
-                Disconnect::ByApplication,
-                "HNSSH is shutting down".to_owned(),
-                "en".to_owned(),
-            ).await?;
-            running.await
+    let reason = loop {
+        let (deadline, reason) = match *changes.borrow_and_update() {
+            SetupProgress::Authenticating => (Some(handshake_deadline), HANDSHAKE_TIMEOUT_REASON),
+            SetupProgress::Authenticated(at) => (Some(at + SETUP_TIMEOUT), SETUP_TIMEOUT_REASON),
+            SetupProgress::ShellStarted => (None, ""),
+        };
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break "HNSSH is shutting down",
+            result = &mut running => return result,
+            Ok(()) = changes.changed() => continue,
+            _ = async {
+                match deadline {
+                    Some(deadline) => sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => break reason,
         }
+    };
+
+    // The SSH disconnect reason is available even without a session channel.
+    // Never let an unresponsive peer extend teardown indefinitely.
+    let result = timeout(SESSION_DRAIN_TIMEOUT, async {
+        handle
+            .disconnect(
+                Disconnect::ByApplication,
+                reason.to_owned(),
+                "en".to_owned(),
+            )
+            .await?;
+        running.as_mut().await
+    })
+    .await;
+    drop(transport);
+    match result {
+        Ok(result) => result,
+        Err(_) => Ok(()),
     }
+}
+
+struct CloseTransport(std::net::TcpStream);
+
+impl Drop for CloseTransport {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SetupProgress {
+    Authenticating,
+    Authenticated(Instant),
+    ShellStarted,
 }
 
 fn report_session_result(joined: Result<Result<(), SessionError>, tokio::task::JoinError>) {
@@ -217,6 +283,8 @@ fn report_session_result(joined: Result<Result<(), SessionError>, tokio::task::J
 
 #[derive(Debug, Error)]
 enum SessionError {
+    #[error("SSH transport error")]
+    Transport(#[from] io::Error),
     #[error("SSH protocol error")]
     Ssh(#[from] russh::Error),
 }
@@ -611,6 +679,7 @@ fn spawn_session_actor(
 }
 
 struct BrowsingSession {
+    progress: watch::Sender<SetupProgress>,
     channel: Option<ChannelId>,
     pty_size: Option<TerminalSize>,
     shell_started: bool,
@@ -622,8 +691,9 @@ struct BrowsingSession {
 }
 
 impl BrowsingSession {
-    fn new(content: Arc<dyn ContentSource>) -> Self {
+    fn new(content: Arc<dyn ContentSource>, progress: watch::Sender<SetupProgress>) -> Self {
         Self {
+            progress,
             channel: None,
             pty_size: None,
             shell_started: false,
@@ -651,6 +721,7 @@ impl BrowsingSession {
             spawn_session_actor(channel, size, Arc::clone(&self.content), session.handle());
         self.events = Some(events);
         self.actor = Some(actor);
+        self.progress.send_replace(SetupProgress::ShellStarted);
         Ok(())
     }
 
@@ -700,6 +771,12 @@ impl Handler for BrowsingSession {
         Ok(Auth::Accept)
     }
 
+    async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), Self::Error> {
+        self.progress
+            .send_replace(SetupProgress::Authenticated(Instant::now()));
+        Ok(())
+    }
+
     async fn channel_open_session(
         &mut self,
         channel: Channel<server::Msg>,
@@ -717,6 +794,67 @@ impl Handler for BrowsingSession {
         Ok(())
     }
 
+    // No forwarding channel is part of a browsing session. Reject explicitly
+    // rather than relying on the default Handler implementations.
+    async fn channel_open_x11(
+        &mut self,
+        _channel: Channel<server::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<server::Msg>,
+        _host: &str,
+        _port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
+    }
+
+    async fn channel_open_forwarded_tcpip(
+        &mut self,
+        _channel: Channel<server::Msg>,
+        _host: &str,
+        _port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
+    }
+
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        _channel: Channel<server::Msg>,
+        _socket_path: &str,
+        reply: server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
+    }
+
     async fn pty_request(
         &mut self,
         channel: ChannelId,
@@ -728,7 +866,11 @@ impl Handler for BrowsingSession {
         _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if !self.owns_channel(channel) || self.pty_size.is_some() || self.shell_started {
+        if !self.owns_channel(channel)
+            || self.pty_size.is_some()
+            || self.shell_started
+            || self.closed
+        {
             session.channel_failure(channel)?;
             return Ok(());
         }
@@ -827,12 +969,69 @@ impl Handler for BrowsingSession {
         Ok(())
     }
 
+    async fn x11_request(
+        &mut self,
+        channel: ChannelId,
+        _single_connection: bool,
+        _auth_protocol: &str,
+        _auth_cookie: &str,
+        _screen_number: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel)?;
+        Ok(())
+    }
+
+    async fn agent_request(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // The pinned russh patch maps this to a channel reply, honoring want_reply.
+        Ok(false)
+    }
+
+    async fn tcpip_forward(
+        &mut self,
+        _address: &str,
+        _port: &mut u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    async fn cancel_tcpip_forward(
+        &mut self,
+        _address: &str,
+        _port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    async fn streamlocal_forward(
+        &mut self,
+        _socket_path: &str,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    async fn cancel_streamlocal_forward(
+        &mut self,
+        _socket_path: &str,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
     async fn channel_eof(
         &mut self,
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if self.owns_channel(channel) {
+            self.closed = true;
             self.stop_actor();
         }
         Ok(())
