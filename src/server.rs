@@ -12,8 +12,10 @@ use russh::server::{self, Auth, Handler, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect, MethodSet, Pty};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::mpsc::{
+    Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
+};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -37,6 +39,12 @@ const MAX_ROWS: u16 = 120;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const INPUT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(50);
+const INPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const INPUT_BYTES_PER_SECOND: usize = 8 * 1024;
+const INPUT_BURST_BYTES: usize = 16 * 1024;
+const INPUT_QUEUE_BYTES: usize = INPUT_BURST_BYTES;
+const INPUT_QUEUE_PACKETS: usize = 16;
 const HANDSHAKE_TIMEOUT_REASON: &str =
     "HNSSH handshake timed out. Reconnect with an SSH client and authenticate within 10 seconds.";
 const SETUP_TIMEOUT_REASON: &str =
@@ -47,6 +55,8 @@ const ENTER_SCREEN: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l";
 const LEAVE_SCREEN: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1049l";
 const PTY_REQUIRED_MESSAGE: &[u8] =
     b"HNSSH requires an interactive terminal.\r\nReconnect with: ssh -t <hostname>\r\n";
+const INPUT_RATE_LIMIT_MESSAGE: &[u8] =
+    b"HNSSH closed this browsing session because its input rate stayed above 8 KiB/s.\r\n";
 
 type RemoteTerminal = Terminal<CrosstermBackend<OutputBuffer>>;
 
@@ -313,6 +323,56 @@ fn clamp_dimension(value: u32, previous: u16, maximum: u16) -> u16 {
         previous
     } else {
         value.min(u32::from(maximum)) as u16
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputRateDecision {
+    Allow,
+    Drop,
+    Close,
+}
+
+struct InputRateLimiter {
+    tokens: f64,
+    excess: f64,
+    updated_at: Instant,
+}
+
+impl InputRateLimiter {
+    fn new() -> Self {
+        Self::at(Instant::now())
+    }
+
+    fn at(now: Instant) -> Self {
+        Self {
+            tokens: INPUT_BURST_BYTES as f64,
+            excess: 0.0,
+            updated_at: now,
+        }
+    }
+
+    fn check(&mut self, bytes: usize, now: Instant) -> InputRateDecision {
+        let refill = now.saturating_duration_since(self.updated_at).as_secs_f64()
+            * INPUT_BYTES_PER_SECOND as f64;
+        self.updated_at = now;
+        let debt_payment = refill.min(self.excess);
+        self.excess -= debt_payment;
+        self.tokens = (self.tokens + refill - debt_payment).min(INPUT_BURST_BYTES as f64);
+
+        let bytes = bytes as f64;
+        if bytes <= self.tokens {
+            self.tokens -= bytes;
+            return InputRateDecision::Allow;
+        }
+
+        self.excess += bytes - self.tokens;
+        self.tokens = 0.0;
+        if self.excess > INPUT_BURST_BYTES as f64 {
+            InputRateDecision::Close
+        } else {
+            InputRateDecision::Drop
+        }
     }
 }
 
@@ -678,6 +738,92 @@ fn spawn_session_actor(
     (event_sender, task)
 }
 
+#[derive(Clone)]
+struct InputSender {
+    packets: Sender<QueuedInput>,
+    capacity: Arc<Semaphore>,
+}
+
+impl InputSender {
+    async fn send(&self, bytes: Vec<u8>) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
+        let Ok(permits) = u32::try_from(bytes.len()) else {
+            return false;
+        };
+        if bytes.len() > INPUT_QUEUE_BYTES {
+            return false;
+        }
+
+        let capacity = Arc::clone(&self.capacity);
+        let permit = tokio::select! {
+            biased;
+            _ = self.packets.closed() => return false,
+            permit = capacity.acquire_many_owned(permits) => match permit {
+                Ok(permit) => permit,
+                Err(_) => return false,
+            },
+        };
+        self.packets
+            .send(QueuedInput {
+                bytes,
+                _capacity: permit,
+            })
+            .await
+            .is_ok()
+    }
+}
+
+struct QueuedInput {
+    bytes: Vec<u8>,
+    _capacity: OwnedSemaphorePermit,
+}
+
+fn spawn_input_decoder(events: UnboundedSender<ActorEvent>) -> (InputSender, JoinHandle<()>) {
+    let (packets, mut queued): (Sender<QueuedInput>, Receiver<QueuedInput>) =
+        channel(INPUT_QUEUE_PACKETS);
+    let input = InputSender {
+        packets,
+        capacity: Arc::new(Semaphore::new(INPUT_QUEUE_BYTES)),
+    };
+    let task = tokio::spawn(async move {
+        let mut decoder = InputDecoder::default();
+        loop {
+            let packet = if decoder.is_waiting_for_escape_key() {
+                tokio::select! {
+                    biased;
+                    _ = events.closed() => break,
+                    packet = queued.recv() => packet,
+                    _ = tokio::time::sleep(INPUT_ESCAPE_TIMEOUT) => {
+                        if let Some(key) = decoder.expire_escape_key()
+                            && events.send(ActorEvent::Input(key)).is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = events.closed() => break,
+                    packet = queued.recv() => packet,
+                }
+            };
+            let Some(QueuedInput { bytes, .. }) = packet else {
+                break;
+            };
+            for key in decoder.push(&bytes) {
+                if events.send(ActorEvent::Input(key)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    (input, task)
+}
+
 struct BrowsingSession {
     progress: watch::Sender<SetupProgress>,
     channel: Option<ChannelId>,
@@ -685,7 +831,9 @@ struct BrowsingSession {
     shell_started: bool,
     closed: bool,
     content: Arc<dyn ContentSource>,
-    input: InputDecoder,
+    input_rate: InputRateLimiter,
+    input: Option<InputSender>,
+    input_task: Option<JoinHandle<()>>,
     events: Option<UnboundedSender<ActorEvent>>,
     actor: Option<JoinHandle<()>>,
 }
@@ -699,7 +847,9 @@ impl BrowsingSession {
             shell_started: false,
             closed: false,
             content,
-            input: InputDecoder::default(),
+            input_rate: InputRateLimiter::new(),
+            input: None,
+            input_task: None,
             events: None,
             actor: None,
         }
@@ -719,6 +869,9 @@ impl BrowsingSession {
         session.data(channel, ENTER_SCREEN.to_vec())?;
         let (events, actor) =
             spawn_session_actor(channel, size, Arc::clone(&self.content), session.handle());
+        let (input, input_task) = spawn_input_decoder(events.clone());
+        self.input = Some(input);
+        self.input_task = Some(input_task);
         self.events = Some(events);
         self.actor = Some(actor);
         self.progress.send_replace(SetupProgress::ShellStarted);
@@ -748,6 +901,70 @@ impl BrowsingSession {
         Ok(())
     }
 
+    fn finish_for_input_excess(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), SessionError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.abort_input();
+        self.stop_actor();
+        if let Some(actor) = self.actor.take() {
+            actor.abort();
+        }
+        let mut message = if self.shell_started {
+            LEAVE_SCREEN.to_vec()
+        } else {
+            Vec::new()
+        };
+        message.extend_from_slice(INPUT_RATE_LIMIT_MESSAGE);
+        session.data(channel, message)?;
+        session.exit_status_request(channel, 1)?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+
+    fn charge_inbound_bytes(
+        &mut self,
+        channel: ChannelId,
+        bytes: usize,
+        session: &mut Session,
+    ) -> Result<bool, SessionError> {
+        if !self.owns_channel(channel) || self.closed {
+            return Ok(false);
+        }
+
+        match self.input_rate.check(bytes, Instant::now()) {
+            InputRateDecision::Allow => Ok(true),
+            InputRateDecision::Drop => Ok(false),
+            InputRateDecision::Close => {
+                self.finish_for_input_excess(channel, session)?;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn drain_input(&mut self) {
+        self.input.take();
+        if let Some(mut task) = self.input_task.take()
+            && timeout(INPUT_DRAIN_TIMEOUT, &mut task).await.is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    fn abort_input(&mut self) {
+        self.input.take();
+        if let Some(task) = self.input_task.take() {
+            task.abort();
+        }
+    }
+
     fn stop_actor(&mut self) {
         if let Some(events) = self.events.take() {
             let _ = events.send(ActorEvent::Stop);
@@ -757,6 +974,7 @@ impl BrowsingSession {
 
 impl Drop for BrowsingSession {
     fn drop(&mut self) {
+        self.abort_input();
         self.stop_actor();
         if let Some(actor) = self.actor.take() {
             actor.abort();
@@ -924,17 +1142,25 @@ impl Handler for BrowsingSession {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if !self.owns_channel(channel) || !self.shell_started || self.closed {
+        if !self.charge_inbound_bytes(channel, data.len(), session)? || !self.shell_started {
             return Ok(());
         }
-
-        if let Some(events) = &self.events {
-            for key in self.input.push(data) {
-                let _ = events.send(ActorEvent::Input(key));
-            }
+        if let Some(input) = self.input.clone() {
+            let _ = input.send(data.to_vec()).await;
         }
+        Ok(())
+    }
+
+    async fn extended_data(
+        &mut self,
+        channel: ChannelId,
+        _code: u32,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let _ = self.charge_inbound_bytes(channel, data.len(), session)?;
         Ok(())
     }
 
@@ -1030,8 +1256,11 @@ impl Handler for BrowsingSession {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if self.owns_channel(channel) {
+        if self.owns_channel(channel) && !self.closed {
             self.closed = true;
+            // Data and EOF callbacks are ordered. Closing the bounded input
+            // queue lets its decoder forward every admitted key before Stop.
+            self.drain_input().await;
             self.stop_actor();
         }
         Ok(())
@@ -1044,6 +1273,7 @@ impl Handler for BrowsingSession {
     ) -> Result<(), Self::Error> {
         if self.owns_channel(channel) {
             self.closed = true;
+            self.abort_input();
             self.stop_actor();
         }
         Ok(())
@@ -1069,6 +1299,76 @@ mod tests {
                 rows: MAX_ROWS,
             }
         );
+    }
+
+    #[test]
+    fn input_rate_limiter_tolerates_a_burst_and_recovers_at_eight_kibibytes_per_second() {
+        let start = Instant::now();
+        let mut limiter = InputRateLimiter::at(start);
+
+        assert_eq!(
+            limiter.check(INPUT_BURST_BYTES, start),
+            InputRateDecision::Allow
+        );
+        assert_eq!(limiter.check(1, start), InputRateDecision::Drop);
+        assert_eq!(
+            limiter.check(INPUT_BYTES_PER_SECOND - 1, start + Duration::from_secs(1)),
+            InputRateDecision::Allow
+        );
+        assert_eq!(
+            limiter.check(INPUT_BYTES_PER_SECOND, start + Duration::from_secs(2)),
+            InputRateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn sustained_excess_cannot_reuse_refill_for_both_debt_and_tokens() {
+        let start = Instant::now();
+        let mut limiter = InputRateLimiter::at(start);
+
+        assert_eq!(
+            limiter.check(INPUT_BURST_BYTES, start),
+            InputRateDecision::Allow
+        );
+        for second in 1..=4 {
+            assert_eq!(
+                limiter.check(12 * 1024, start + Duration::from_secs(second)),
+                InputRateDecision::Drop
+            );
+        }
+        assert_eq!(
+            limiter.check(12 * 1024, start + Duration::from_secs(5)),
+            InputRateDecision::Close
+        );
+    }
+
+    #[test]
+    fn input_rate_limiter_closes_repeated_excess_but_not_the_first_excess() {
+        let start = Instant::now();
+        let mut limiter = InputRateLimiter::at(start);
+
+        assert_eq!(
+            limiter.check(INPUT_BURST_BYTES, start),
+            InputRateDecision::Allow
+        );
+        assert_eq!(
+            limiter.check(INPUT_BURST_BYTES, start),
+            InputRateDecision::Drop
+        );
+        assert_eq!(limiter.check(1, start), InputRateDecision::Close);
+    }
+
+    #[tokio::test]
+    async fn input_decoder_stops_when_the_actor_event_receiver_closes() {
+        let (events, actor_events) = unbounded_channel();
+        let (input, task) = spawn_input_decoder(events);
+        drop(actor_events);
+
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("input decoder did not observe actor termination")
+            .expect("input decoder task failed");
+        assert!(!input.send(b"j".to_vec()).await);
     }
 
     #[test]

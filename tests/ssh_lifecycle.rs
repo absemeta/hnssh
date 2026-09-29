@@ -900,6 +900,248 @@ async fn visitor_browses_fixture_details_links_and_help_without_losing_their_pla
 }
 
 #[tokio::test]
+async fn an_admitted_quit_is_processed_before_following_channel_eof() -> TestResult {
+    let server = TestServer::start().await?;
+    let (connection, mut channel, mut terminal, mut output) = open_terminal(&server).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut output, "Top feed").await?;
+
+    channel.data_bytes(&b"q"[..]).await?;
+    channel.eof().await?;
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 0);
+    assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?1049l"));
+
+    connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await
+}
+
+#[tokio::test]
+async fn fragmented_escape_and_utf8_input_preserve_following_navigation() -> TestResult {
+    let server = TestServer::start().await?;
+    let (connection, mut channel, mut terminal, mut output) = open_terminal(&server).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "> 1. Rust reaches the tiny terminal",
+    )
+    .await?;
+
+    for fragment in [b"\x1b".as_slice(), b"[", b"B"] {
+        channel.data_bytes(fragment).await?;
+    }
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "> 2. Ask HN: What are you building this week?",
+    )
+    .await?;
+
+    let euro = "€".as_bytes();
+    channel.data_bytes(&euro[..1]).await?;
+    channel.data_bytes(&euro[1..2]).await?;
+    let mut final_utf8_and_navigation = euro[2..].to_vec();
+    final_utf8_and_navigation.extend_from_slice(b"\x1b[A");
+    channel.data_bytes(final_utf8_and_navigation).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "> 1. Rust reaches the tiny terminal",
+    )
+    .await?;
+
+    channel.data_bytes(&[0xf0, 0x80, 0x80, b'j'][..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "> 2. Ask HN: What are you building this week?",
+    )
+    .await?;
+
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 0);
+    connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await
+}
+
+#[tokio::test]
+async fn overlong_unterminated_input_is_bounded_and_recovers_for_navigation() -> TestResult {
+    const PENDING_INPUT_LIMIT: usize = 8 * 1024;
+
+    let server = TestServer::start().await?;
+    let (connection, mut channel, mut terminal, mut output) = open_terminal(&server).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "> 1. Rust reaches the tiny terminal",
+    )
+    .await?;
+
+    let mut unterminated = Vec::with_capacity(PENDING_INPUT_LIMIT);
+    unterminated.extend_from_slice(b"\x1b[");
+    unterminated.resize(PENDING_INPUT_LIMIT, b'1');
+    channel.data_bytes(unterminated).await?;
+    channel.data_bytes(&b"j"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "> 2. Ask HN: What are you building this week?",
+    )
+    .await?;
+
+    channel.data_bytes(&b"\x1b[12\xffk"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "> 1. Rust reaches the tiny terminal",
+    )
+    .await?;
+
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 0);
+    connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await
+}
+
+#[tokio::test]
+async fn a_sixteen_kibibyte_input_burst_is_tolerated() -> TestResult {
+    let server = TestServer::start().await?;
+    let (connection, mut channel, mut terminal, mut output) = open_terminal(&server).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "> 1. Rust reaches the tiny terminal",
+    )
+    .await?;
+
+    channel.data_bytes(vec![b'x'; 16 * 1024]).await?;
+    sleep(Duration::from_millis(20)).await;
+    channel.data_bytes(&b"j"[..]).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "> 2. Ask HN: What are you building this week?",
+    )
+    .await?;
+
+    channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 0);
+    connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await
+}
+
+#[tokio::test]
+async fn extended_data_is_charged_to_the_session_input_budget() -> TestResult {
+    let server = TestServer::start().await?;
+    let (connection, mut channel, mut terminal, mut output) = open_terminal(&server).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut output, "Top feed").await?;
+
+    for _ in 0..4 {
+        if channel
+            .extended_data_bytes(1, vec![b'x'; 16 * 1024])
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 1);
+    assert!(String::from_utf8_lossy(&output).contains("input rate stayed above 8 KiB/s"));
+
+    connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await
+}
+
+#[tokio::test]
+async fn sustained_input_excess_closes_only_the_abusive_session() -> TestResult {
+    let server = TestServer::start().await?;
+    let abusive = open_terminal(&server).await?;
+    let healthy = open_terminal(&server).await?;
+    let (abusive_connection, mut abusive_channel, mut abusive_terminal, mut abusive_output) =
+        abusive;
+    let (healthy_connection, mut healthy_channel, mut healthy_terminal, mut healthy_output) =
+        healthy;
+
+    let (abusive_ready, healthy_ready) = tokio::join!(
+        read_until_visible(
+            &mut abusive_channel,
+            &mut abusive_terminal,
+            &mut abusive_output,
+            "Rust reaches the tiny terminal",
+        ),
+        read_until_visible(
+            &mut healthy_channel,
+            &mut healthy_terminal,
+            &mut healthy_output,
+            "Rust reaches the tiny terminal",
+        )
+    );
+    abusive_ready?;
+    healthy_ready?;
+
+    for _ in 0..4 {
+        if abusive_channel
+            .data_bytes(vec![b'x'; 16 * 1024])
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        read_through_close(&mut abusive_channel, &mut abusive_output).await?,
+        1
+    );
+    assert!(String::from_utf8_lossy(&abusive_output).contains("input rate stayed above 8 KiB/s"));
+
+    healthy_channel.data_bytes(&b"j"[..]).await?;
+    read_until_visible(
+        &mut healthy_channel,
+        &mut healthy_terminal,
+        &mut healthy_output,
+        "> 2. Ask HN: What are you building this week?",
+    )
+    .await?;
+    healthy_channel.data_bytes(&b"q"[..]).await?;
+    assert_eq!(
+        read_through_close(&mut healthy_channel, &mut healthy_output).await?,
+        0
+    );
+
+    abusive_connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    healthy_connection
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+        .await
+        .ok();
+    server.stop().await
+}
+
+#[tokio::test]
 async fn loading_fixture_entries_do_not_move_the_visitors_selection() -> TestResult {
     let gate = Arc::new(Semaphore::new(0));
     let content = Arc::new(GatedFixtureContent {
