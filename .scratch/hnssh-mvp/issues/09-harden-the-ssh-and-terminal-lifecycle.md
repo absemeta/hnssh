@@ -4,17 +4,17 @@
 
 **Blocked by:** 02 — Browse a fixture top feed; 07 — Make entry links and comment threads direct, navigable, and readable.
 
-**Status:** in-progress
+**Status:** complete
 
 - [x] At most one session channel, one accepted PTY, and one shell request are permitted per connection.
 - [x] Exec, subsystem, environment mutation, agent, X11, direct or forwarded TCP channels, and additional channels are explicitly rejected.
 - [x] Handshake and PTY/shell establishment each have a ten-second deadline and close with an actionable reason when the channel permits.
 - [x] A persistent incremental parser handles escape sequences and UTF-8 split or coalesced across SSH packets with at most 8 KiB pending input.
 - [x] Input is limited to 8 KiB/s with a 16 KiB burst, and repeated excess closes only the offending browsing session.
-- [ ] Dimensions are clamped to 300 columns by 120 rows, and zero dimensions do not replace the last usable viewport.
-- [ ] One persistent Ratatui terminal and a bounded asynchronous output path retain at most the latest pending complete frame for slow readers; superseded animation frames are coalesced.
-- [ ] EOF, channel close, send failure, timeout, `q` or Ctrl+C, and transport loss cancel all session-owned tasks; writable graceful paths attempt style reset, cursor show, alternate-screen exit, exit status, EOF, and close.
-- [ ] Protocol-level acceptance tests cover unsupported requests, ordering variants, fragmented keys, UTF-8 boundaries, excessive input, huge/zero resize, slow/non-reading clients, abrupt loss, and cleanup.
+- [x] Dimensions are clamped to 300 columns by 120 rows, and zero dimensions do not replace the last usable viewport.
+- [x] One persistent Ratatui terminal and a bounded asynchronous output path retain at most the latest pending complete frame for slow readers; superseded animation frames are coalesced.
+- [x] EOF, channel close, send failure, timeout, `q` or Ctrl+C, and transport loss cancel all session-owned tasks; writable graceful paths attempt style reset, cursor show, alternate-screen exit, exit status, EOF, and close.
+- [x] Protocol-level acceptance tests cover unsupported requests, ordering variants, fragmented keys, UTF-8 boundaries, excessive input, huge/zero resize, slow/non-reading clients, abrupt loss, and cleanup.
 
 ## Targeted protocol-acceptance increment
 
@@ -30,4 +30,28 @@ The input increment adds one persistent decoder task per established browsing se
 
 Ordinary and extended channel data are charged before parsing or discarding to one per-session token bucket refilling at 8 KiB/s with a 16 KiB burst. A first transient overage is dropped; each refill pays excess debt before replenishing tokens, while repeated or sustained excess closes that channel with a nonzero status and leaves concurrent visitors usable. The decoder queue is byte-bounded to 16 KiB, observes actor termination, and drains admitted packets for at most one second before EOF delivers actor stop, preserving an accepted `q` without creating an unbounded teardown wait. Unit tests cover every supported escape-sequence boundary, split UTF-8, malformed/overlong recovery, the pending bound, refill/debt accounting, sustained advancing-time excess, and decoder termination. Real-SSH tests cover fragmented keys and UTF-8 followed by navigation, bounded malformed input recovery, full-burst tolerance, ordinary and extended-data abuse closure, isolation from a concurrent healthy visitor, and `q` immediately followed by EOF.
 
-Bounded output, full graceful terminal restoration across every closure path, idle/lifetime policy, and the remaining hostile-client acceptance coverage remain outside this increment. The overall issue remains open.
+## Output and lifecycle completion
+
+`src/terminal_output.rs` hides the persistent Ratatui terminal, complete-frame mailbox, SSH-window-aware writer, and ordered restoration. The mailbox replaces the pending complete frame rather than queuing ANSI diffs. The writer finishes its active frame and computes the next diff against the last fully submitted screen; dropped snapshots never become its baseline. Viewport changes (including away-and-back changes) invalidate that baseline, and hyperlink overlays trigger a repaint to remove obsolete links/styles. One writer task submits window-reserved, packet-sized data through Russh's bounded event queue. Only fixed-size restoration bypasses window reservations, with a one-second enqueue budget. A partial OSC is terminated and OSC 8 is closed before style reset, cursor show, alternate-screen exit, exit status, EOF, and close.
+
+`src/server.rs` keeps browsing state single-owned, coalesces dimensions through a watch mailbox, bounds decoded keys to 128, and replaces the unbounded content-result channel with at most eight active item/comment futures/results and one separately bounded, coalesced top-feed lane. Pending load descriptors describe the content requested by the browsing state; semaphore-waiting tasks are no longer spawned for every requested item. The existing byte limiter and byte-bounded decoder input remain unchanged. Rendering never awaits SSH output. On quit, EOF, channel close, render/output error, shutdown, or loss, acquisition is aborted and joined and the writer attempts bounded restoration. The connection owns the actor and decoder task scope; ordinary teardown cancels/joins it, while forced server-future cancellation aborts all descendants and shuts down the transport guard. An unacknowledged channel closure receives a two-second acknowledgement budget followed by bounded SSH disconnect/transport shutdown. A completed writable channel still rejects additional channels on the same connection.
+
+The real-SSH acceptance additions live in `tests/support/ssh_output.rs`, using the existing fake-content/terminal-emulator seam:
+
+- Huge PTY and window-change dimensions render at exactly 300x120; all-zero and independently zero axes preserve the preceding usable viewport.
+- A controllable encrypted-read gate and 1 KiB SSH receive window stop transport-level window replenishment while outbound input and resize remain live. Two thousand resizes and superseded navigation frames recover to the exact healthy visitor's screen, with a generous bounded output-size assertion. A second recovery without resize verifies same-size diffs.
+- Pending-content probes prove cancellation on writable EOF, q, Ctrl+C, and shutdown; the emulator verifies reset styles, visible cursor, and alternate-screen exit before exit status, EOF, and close.
+- Non-reading visitors cover q, EOF, channel close, abrupt TCP shutdown (not an SSH disconnect request), server shutdown, and forced server-future cancellation during output/acquisition. q/EOF transport closure is observed without granting further SSH credit, before stopping the server. Concurrent healthy visitors remain usable. The earlier SSH-disconnect test is renamed accurately and retained.
+
+Verification: baseline `cargo test` passed 28 unit and 39 acceptance tests. Final `cargo test` passed 28 unit and 45 acceptance tests; `cargo fmt --check`, strict all-target/all-feature Clippy, and `git diff --check` passed. Focused output acceptance and original protocol/thread regressions also passed. The two pre-existing vendored compiler warnings remain; no vendor patch or dependencies changed. Render-error handling shares the cancellation/restoration epilogue; deterministic acceptance exercises real output/transport failures rather than introducing an artificial rendering-failure hook.
+
+## Independent-review fixes
+
+Review reproduced two missing cases: Russh awaits TCP flushes outside its SSH-input select, and the initial bounded scheduler accidentally queued top-feed refresh behind all item/comment work. Both are addressed without expanding the vendor patch or updating dependencies:
+
+- `src/ssh_transport.rs` wraps the TCP stream with an inline write-episode budget. The first pending socket write arms an absolute two-second deadline; partial progress cannot renew it. Accepting the entire supplied remainder or successfully flushing ends the episode, including Russh's identification write which does not call flush. Expiry returns a typed I/O timeout to Russh, drops its handler, and lets the connection owner cancel/join browsing work even without q/EOF/resize callbacks. This adds no task, application buffer, idle timeout, or lifetime policy.
+- Top-feed acquisition has one active future/result plus one coalesced pending update, independent of the eight item/comment slots. A saved slow thread therefore cannot prevent fetching the latest top-feed ranking. Both acquisition lanes are aborted and joined at termination.
+- `tests/support/ssh_adversarial_transport.rs` advertises nearly 4 GiB of SSH credit, constrains TCP receive buffering, stops encrypted reads, and drives bounded paced repaints containing a long validated link. Pending acquisition is cancelled and the transport closes without resuming SSH reads, including a case that sends no q/EOF/shutdown and variants sending q or EOF. An already-established healthy visitor remains usable. A separate regression gates all eight comment futures, returns to the feed, and observes a changed (empty) top-feed ranking before any gate releases; quitting cancels the saved thread work.
+- Negative controls temporarily removed the TCP adapter and made top-feed acquisition depend on a free item slot. Both new acceptance tests failed by bounded timeout. Restoring the fixes made both pass, proving the tests distinguish TCP saturation from SSH-window exhaustion and detect the scheduling regression.
+
+Limits: no bytes can be restored after transport loss, peer channel removal, or forced task abortion; an unwritable peer receives attempts, not a delivery guarantee. Idle/lifetime policy, production SIGTERM orchestration, and the 200-session capacity gate remain later issues and are not claimed here.

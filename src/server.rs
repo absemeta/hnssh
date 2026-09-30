@@ -1,22 +1,20 @@
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
-use ratatui::{Terminal, TerminalOptions, Viewport};
 use russh::keys::{PrivateKey, load_secret_key};
 use russh::server::{self, Auth, Handler, Session};
-use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect, MethodSet, Pty};
+use russh::{Channel, ChannelId, ChannelOpenFailure, ChannelWriteHalf, Disconnect, MethodSet, Pty};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{
-    Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
-};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -27,6 +25,8 @@ use crate::content::{
 };
 use crate::hacker_news::HackerNewsContent;
 use crate::input::{InputDecoder, Key};
+use crate::ssh_transport::SshTransport;
+use crate::terminal_output::TerminalOutput;
 use crate::thread::{CommentLoad, CommentUpdate};
 use crate::ui;
 
@@ -45,47 +45,18 @@ const INPUT_BYTES_PER_SECOND: usize = 8 * 1024;
 const INPUT_BURST_BYTES: usize = 16 * 1024;
 const INPUT_QUEUE_BYTES: usize = INPUT_BURST_BYTES;
 const INPUT_QUEUE_PACKETS: usize = 16;
+const INPUT_QUEUE_KEYS: usize = 128;
 const HANDSHAKE_TIMEOUT_REASON: &str =
     "HNSSH handshake timed out. Reconnect with an SSH client and authenticate within 10 seconds.";
 const SETUP_TIMEOUT_REASON: &str =
     "HNSSH requires a PTY and shell within 10 seconds. Reconnect with: ssh -t <hostname>";
 const TOP_FEED_PAGE_SIZE: usize = 30;
 const PAGE_ITEM_CONCURRENCY: usize = 8;
-const ENTER_SCREEN: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l";
-const LEAVE_SCREEN: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1049l";
+
 const PTY_REQUIRED_MESSAGE: &[u8] =
     b"HNSSH requires an interactive terminal.\r\nReconnect with: ssh -t <hostname>\r\n";
 const INPUT_RATE_LIMIT_MESSAGE: &[u8] =
     b"HNSSH closed this browsing session because its input rate stayed above 8 KiB/s.\r\n";
-
-type RemoteTerminal = Terminal<CrosstermBackend<OutputBuffer>>;
-
-#[derive(Clone, Default)]
-struct OutputBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl OutputBuffer {
-    fn take(&self) -> io::Result<Vec<u8>> {
-        let mut buffer = self
-            .0
-            .lock()
-            .map_err(|_| io::Error::other("terminal output buffer lock poisoned"))?;
-        Ok(std::mem::take(&mut *buffer))
-    }
-}
-
-impl io::Write for OutputBuffer {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .map_err(|_| io::Error::other("terminal output buffer lock poisoned"))?
-            .extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -211,13 +182,14 @@ async fn run_connection(
     // stalled writes, including when Server::run aborts its connection tasks.
     let socket = stream.into_std()?;
     let transport = CloseTransport(socket.try_clone()?);
-    let stream = TcpStream::from_std(socket)?;
+    let stream = SshTransport::new(TcpStream::from_std(socket)?);
+    let scope = SessionScope::new();
     let (progress, mut changes) = watch::channel(SetupProgress::Authenticating);
     let running = tokio::select! {
         biased;
         _ = shutdown.cancelled() => return Ok(()),
         result = timeout_at(handshake_deadline, server::run_stream(
-            config, stream, BrowsingSession::new(content, progress),
+            config, stream, BrowsingSession::new(content, progress, &scope),
         )) => match result {
             Ok(result) => result?,
             // Before identification/key exchange there is no usable encrypted channel.
@@ -227,16 +199,30 @@ async fn run_connection(
     let handle = running.handle();
     tokio::pin!(running);
 
+    let mut actor_finished = false;
+    let mut close_deadline = None;
     let reason = loop {
         let (deadline, reason) = match *changes.borrow_and_update() {
             SetupProgress::Authenticating => (Some(handshake_deadline), HANDSHAKE_TIMEOUT_REASON),
             SetupProgress::Authenticated(at) => (Some(at + SETUP_TIMEOUT), SETUP_TIMEOUT_REASON),
-            SetupProgress::ShellStarted => (None, ""),
+            SetupProgress::ShellStarted => (close_deadline, "HNSSH browsing session ended"),
         };
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => break "HNSSH is shutting down",
-            result = &mut running => return result,
+            result = &mut running => {
+                scope.drain().await;
+                return result;
+            },
+            _ = scope.ended.cancelled(), if !actor_finished => {
+                actor_finished = true;
+                if !scope.channel_closed.is_cancelled() {
+                    close_deadline = Some(Instant::now() + SESSION_DRAIN_TIMEOUT);
+                }
+            },
+            _ = scope.channel_closed.cancelled(), if close_deadline.is_some() => {
+                close_deadline = None;
+            },
             Ok(()) = changes.changed() => continue,
             _ = async {
                 match deadline {
@@ -250,6 +236,7 @@ async fn run_connection(
     // The SSH disconnect reason is available even without a session channel.
     // Never let an unresponsive peer extend teardown indefinitely.
     let result = timeout(SESSION_DRAIN_TIMEOUT, async {
+        scope.drain().await;
         handle
             .disconnect(
                 Disconnect::ByApplication,
@@ -264,6 +251,40 @@ async fn run_connection(
     match result {
         Ok(result) => result,
         Err(_) => Ok(()),
+    }
+}
+
+// The connection owns all session children even when Russh detaches its own
+// task. Drop aborts children on forced server-future cancellation; ordinary
+// teardown cancels and joins them before disconnecting the transport.
+struct SessionScope {
+    stop: CancellationToken,
+    ended: CancellationToken,
+    channel_closed: CancellationToken,
+    tasks: Arc<Mutex<JoinSet<()>>>,
+}
+
+impl SessionScope {
+    fn new() -> Self {
+        Self {
+            stop: CancellationToken::new(),
+            ended: CancellationToken::new(),
+            channel_closed: CancellationToken::new(),
+            tasks: Arc::new(Mutex::new(JoinSet::new())),
+        }
+    }
+
+    async fn drain(&self) {
+        self.stop.cancel();
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().expect("session task scope"));
+        while tasks.join_next().await.is_some() {}
+    }
+}
+
+impl Drop for SessionScope {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        self.tasks.lock().expect("session task scope").abort_all();
     }
 }
 
@@ -401,9 +422,6 @@ enum ActorEvent {
         load: CommentLoad,
         result: Result<ContentSnapshot<Comment>, ContentError>,
     },
-    Input(Key),
-    Resize(TerminalSize),
-    Stop,
 }
 
 #[derive(Debug, Error)]
@@ -412,75 +430,135 @@ enum ActorError {
     Terminal(#[from] io::Error),
     #[error("SSH output channel closed")]
     OutputClosed,
+    #[error("session input rate exceeded")]
+    InputExcess,
+}
+
+enum ContentJob {
+    FeedEntry(FeedEntryLoad, ContentUpdate),
+    Comment(CommentLoad),
 }
 
 struct SessionActor {
-    channel: ChannelId,
     size: TerminalSize,
     source: Arc<dyn ContentSource>,
-    item_limit: Arc<Semaphore>,
-    load_tasks: JoinSet<()>,
+    // Top-feed acquisition has one coalesced lane independent of the eight
+    // item/comment futures/results. Returning from a slow thread must not
+    // leave feed refresh queued behind work for that thread.
+    top_feed_task: JoinSet<ActorEvent>,
+    pending_top_feed: Option<ContentUpdate>,
+    // Pending loads describe the content requested by the owned browsing
+    // state, not output frames or semaphore-waiting tasks.
+    load_tasks: JoinSet<ActorEvent>,
+    pending_loads: VecDeque<ContentJob>,
     browser: Browser,
-    terminal: RemoteTerminal,
-    output: OutputBuffer,
-    handle: server::Handle,
+    output: TerminalOutput,
 }
 
 impl SessionActor {
     fn new(
-        channel: ChannelId,
+        channel: ChannelWriteHalf<server::Msg>,
         size: TerminalSize,
         source: Arc<dyn ContentSource>,
         handle: server::Handle,
     ) -> Result<Self, ActorError> {
-        let output = OutputBuffer::default();
-        let backend = CrosstermBackend::new(output.clone());
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Fixed(size.area()),
-            },
-        )?;
-
         Ok(Self {
-            channel,
             size,
             source,
-            item_limit: Arc::new(Semaphore::new(PAGE_ITEM_CONCURRENCY)),
+            top_feed_task: JoinSet::new(),
+            pending_top_feed: None,
             load_tasks: JoinSet::new(),
+            pending_loads: VecDeque::new(),
             browser: Browser::new(),
-            terminal,
-            output,
-            handle,
+            output: TerminalOutput::new(size.area(), channel, handle)?,
         })
     }
 
     async fn run(
         mut self,
-        mut events: UnboundedReceiver<ActorEvent>,
-        event_sender: UnboundedSender<ActorEvent>,
+        mut keys: Receiver<Key>,
+        mut sizes: watch::Receiver<TerminalSize>,
+        stop: CancellationToken,
+        input_excess: Arc<AtomicBool>,
     ) -> Result<(), ActorError> {
-        self.redraw(&event_sender).await?;
-        self.load_top_feed(event_sender.clone(), ContentUpdate::Initial);
+        let mut result = self.browse(&mut keys, &mut sizes, &stop).await;
+        if input_excess.load(Ordering::Relaxed) {
+            result = Err(ActorError::InputExcess);
+        }
+        self.top_feed_task.abort_all();
+        self.load_tasks.abort_all();
+        while self.top_feed_task.join_next().await.is_some() {}
+        while self.load_tasks.join_next().await.is_some() {}
+        let notice = if matches!(result, Err(ActorError::InputExcess)) {
+            INPUT_RATE_LIMIT_MESSAGE
+        } else {
+            b""
+        };
+        self.output.finish(u32::from(result.is_err()), notice).await;
+        result
+    }
 
+    async fn browse(
+        &mut self,
+        keys: &mut Receiver<Key>,
+        sizes: &mut watch::Receiver<TerminalSize>,
+        stop: &CancellationToken,
+    ) -> Result<(), ActorError> {
+        self.redraw()?;
+        self.pending_top_feed = Some(ContentUpdate::Initial);
+        let output_failed = self.output.failed();
         loop {
-            let event = if self.load_tasks.is_empty() {
-                events.recv().await
-            } else {
-                tokio::select! {
-                    event = events.recv() => event,
-                    joined = self.load_tasks.join_next() => {
-                        if let Some(Err(error)) = joined
-                            && !error.is_cancelled()
-                        {
-                            debug!(%error, "session content task failed");
+            self.start_loads();
+            let event = tokio::select! {
+                _ = stop.cancelled() => return Ok(()),
+                _ = output_failed.cancelled() => return Err(ActorError::OutputClosed),
+                changed = sizes.changed() => {
+                    if changed.is_err() { return Ok(()); }
+                    self.size = *sizes.borrow_and_update();
+                    self.browser.request_entry_reveal();
+                    self.output.resize(self.size.area())?;
+                    self.redraw()?;
+                    continue;
+                }
+                key = keys.recv() => {
+                    let Some(key) = key else { return Ok(()); };
+                    let page_len = ui::navigation_page_len(self.browser.view_kind(), self.size.rows);
+                    match self.browser.handle_key(key, page_len) {
+                        CommandOutcome::Redraw | CommandOutcome::LoadComments => self.redraw()?,
+                        CommandOutcome::RefreshTopFeed => {
+                            self.redraw()?;
+                            self.pending_top_feed = Some(ContentUpdate::Revalidation);
                         }
-                        continue;
+                        CommandOutcome::LoadNextPage => {
+                            let entries = self.browser.load_next_page(TOP_FEED_PAGE_SIZE);
+                            self.redraw()?;
+                            self.load_entries(entries, ContentUpdate::Initial);
+                        }
+                        CommandOutcome::Unchanged => {}
+                        CommandOutcome::Quit => return Ok(()),
+                    }
+                    continue;
+                }
+                joined = self.top_feed_task.join_next(), if !self.top_feed_task.is_empty() => {
+                    match joined {
+                        Some(Ok(event)) => event,
+                        Some(Err(error)) => {
+                            debug!(%error, "session top-feed task failed");
+                            continue;
+                        }
+                        None => continue,
                     }
                 }
-            };
-            let Some(event) = event else {
-                break;
+                joined = self.load_tasks.join_next(), if !self.load_tasks.is_empty() => {
+                    match joined {
+                        Some(Ok(event)) => event,
+                        Some(Err(error)) => {
+                            debug!(%error, "session content task failed");
+                            continue;
+                        }
+                        None => continue,
+                    }
+                }
             };
             match event {
                 ActorEvent::TopFeed { result, update } => {
@@ -488,14 +566,14 @@ impl SessionActor {
                     let loaded = result.is_ok();
                     self.browser
                         .set_top_feed(result, TOP_FEED_PAGE_SIZE, update);
-                    self.redraw(&event_sender).await?;
+                    self.redraw()?;
                     if loaded {
-                        self.load_entries(self.browser.loaded_entries(), &event_sender, update);
+                        self.load_entries(self.browser.loaded_entries(), update);
                     }
                     if revalidate {
                         self.browser.begin_top_feed_revalidation();
-                        self.redraw(&event_sender).await?;
-                        self.load_top_feed(event_sender.clone(), ContentUpdate::Revalidation);
+                        self.redraw()?;
+                        self.pending_top_feed = Some(ContentUpdate::Revalidation);
                     }
                 }
                 ActorEvent::FeedEntry {
@@ -509,13 +587,12 @@ impl SessionActor {
                     if revalidate {
                         self.browser.begin_entry_revalidation();
                     }
-                    self.redraw(&event_sender).await?;
+                    self.redraw()?;
                     if revalidate {
-                        self.load_entry(
+                        self.pending_loads.push_back(ContentJob::FeedEntry(
                             FeedEntryLoad { index, id },
-                            event_sender.clone(),
                             ContentUpdate::Revalidation,
-                        );
+                        ));
                     }
                 }
                 ActorEvent::Comment { load, result } => {
@@ -527,215 +604,89 @@ impl SessionActor {
                         },
                     );
                     self.browser.set_comment(load, result);
-                    self.redraw(&event_sender).await?;
+                    self.redraw()?;
                     if revalidate {
-                        self.load_comment(
-                            CommentLoad {
+                        self.pending_loads
+                            .push_back(ContentJob::Comment(CommentLoad {
                                 update: CommentUpdate::Revalidation,
                                 ..load
-                            },
-                            event_sender.clone(),
-                        );
+                            }));
                     }
                 }
-                ActorEvent::Input(key) => {
-                    let page_len =
-                        ui::navigation_page_len(self.browser.view_kind(), self.size.rows);
-                    match self.browser.handle_key(key, page_len) {
-                        CommandOutcome::Redraw | CommandOutcome::LoadComments => {
-                            self.redraw(&event_sender).await?
-                        }
-                        CommandOutcome::RefreshTopFeed => {
-                            self.redraw(&event_sender).await?;
-                            self.load_top_feed(event_sender.clone(), ContentUpdate::Revalidation);
-                        }
-                        CommandOutcome::LoadNextPage => {
-                            let entries = self.browser.load_next_page(TOP_FEED_PAGE_SIZE);
-                            self.redraw(&event_sender).await?;
-                            self.load_entries(entries, &event_sender, ContentUpdate::Initial);
-                        }
-                        CommandOutcome::Unchanged => {}
-                        CommandOutcome::Quit => {
-                            self.finish().await;
-                            return Ok(());
-                        }
-                    }
-                }
-                ActorEvent::Resize(size) => {
-                    self.size = size;
-                    self.browser.request_entry_reveal();
-                    self.terminal.resize(size.area())?;
-                    self.redraw(&event_sender).await?;
-                }
-                ActorEvent::Stop => return Ok(()),
             }
         }
-
-        Ok(())
     }
 
-    fn load_top_feed(&mut self, events: UnboundedSender<ActorEvent>, update: ContentUpdate) {
-        let source = Arc::clone(&self.source);
-        self.load_tasks.spawn(async move {
-            let result = match update {
-                ContentUpdate::Initial => source.top_feed().await,
-                ContentUpdate::Revalidation => source.refresh_top_feed().await,
-            };
-            let _ = events.send(ActorEvent::TopFeed { result, update });
-        });
+    fn load_entries(&mut self, entries: Vec<FeedEntryLoad>, update: ContentUpdate) {
+        self.pending_loads.extend(
+            entries
+                .into_iter()
+                .map(|entry| ContentJob::FeedEntry(entry, update)),
+        );
     }
 
-    fn load_entries(
-        &mut self,
-        entries: Vec<FeedEntryLoad>,
-        events: &UnboundedSender<ActorEvent>,
-        update: ContentUpdate,
-    ) {
-        for entry in entries {
-            self.load_entry(entry, events.clone(), update);
-        }
-    }
-
-    fn load_entry(
-        &mut self,
-        entry: FeedEntryLoad,
-        events: UnboundedSender<ActorEvent>,
-        update: ContentUpdate,
-    ) {
-        let FeedEntryLoad { index, id } = entry;
-        let source = Arc::clone(&self.source);
-        let item_limit = Arc::clone(&self.item_limit);
-        self.load_tasks.spawn(async move {
-            let permit = match item_limit.acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    let _ = events.send(ActorEvent::FeedEntry {
-                        index,
-                        id,
-                        result: Err(ContentError::Retryable),
-                        update,
-                    });
-                    return;
-                }
-            };
-            let result = match update {
-                ContentUpdate::Initial => source.feed_entry(id).await,
-                ContentUpdate::Revalidation => source.refresh_feed_entry(id).await,
-            };
-            drop(permit);
-            let _ = events.send(ActorEvent::FeedEntry {
-                index,
-                id,
-                result,
-                update,
+    fn start_loads(&mut self) {
+        if self.top_feed_task.is_empty()
+            && let Some(update) = self.pending_top_feed.take()
+        {
+            let source = Arc::clone(&self.source);
+            self.top_feed_task.spawn(async move {
+                let result = match update {
+                    ContentUpdate::Initial => source.top_feed().await,
+                    ContentUpdate::Revalidation => source.refresh_top_feed().await,
+                };
+                ActorEvent::TopFeed { result, update }
             });
-        });
-    }
-
-    fn load_comments(&mut self, loads: Vec<CommentLoad>, events: &UnboundedSender<ActorEvent>) {
-        for load in loads {
-            self.load_comment(load, events.clone());
+        }
+        while self.load_tasks.len() < PAGE_ITEM_CONCURRENCY {
+            let Some(job) = self.pending_loads.pop_front() else {
+                break;
+            };
+            let source = Arc::clone(&self.source);
+            self.load_tasks.spawn(async move {
+                match job {
+                    ContentJob::FeedEntry(FeedEntryLoad { index, id }, update) => {
+                        let result = match update {
+                            ContentUpdate::Initial => source.feed_entry(id).await,
+                            ContentUpdate::Revalidation => source.refresh_feed_entry(id).await,
+                        };
+                        ActorEvent::FeedEntry {
+                            index,
+                            id,
+                            result,
+                            update,
+                        }
+                    }
+                    ContentJob::Comment(load) => {
+                        let result = match load.update {
+                            CommentUpdate::Initial => source.comment(load.id).await,
+                            CommentUpdate::Revalidation => source.refresh_comment(load.id).await,
+                        };
+                        ActorEvent::Comment { load, result }
+                    }
+                }
+            });
         }
     }
 
-    fn load_comment(&mut self, load: CommentLoad, events: UnboundedSender<ActorEvent>) {
-        let source = Arc::clone(&self.source);
-        let item_limit = Arc::clone(&self.item_limit);
-        self.load_tasks.spawn(async move {
-            let permit = match item_limit.acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    let _ = events.send(ActorEvent::Comment {
-                        load,
-                        result: Err(ContentError::Retryable),
-                    });
-                    return;
-                }
-            };
-            let result = match load.update {
-                CommentUpdate::Initial => source.comment(load.id).await,
-                CommentUpdate::Revalidation => source.refresh_comment(load.id).await,
-            };
-            drop(permit);
-            let _ = events.send(ActorEvent::Comment { load, result });
-        });
-    }
-
-    async fn redraw(
-        &mut self,
-        event_sender: &UnboundedSender<ActorEvent>,
-    ) -> Result<(), ActorError> {
-        let candidates = self.render().await?;
+    fn redraw(&mut self) -> Result<(), ActorError> {
+        let candidates = self.render()?;
         let mut loads = self.browser.take_comment_loads();
         let (materialized, nearby_loads) = self.browser.materialize_current_comments(&candidates);
         loads.extend(nearby_loads);
         if materialized {
-            self.render().await?;
+            self.render()?;
         }
-        self.load_comments(loads, event_sender);
+        self.pending_loads
+            .extend(loads.into_iter().map(ContentJob::Comment));
         Ok(())
     }
 
-    async fn render(&mut self) -> Result<Vec<usize>, ActorError> {
+    fn render(&mut self) -> Result<Vec<usize>, ActorError> {
         let browser = &mut self.browser;
         let size = self.size.area();
-        let mut rendered = ui::RenderOutput::default();
-        self.terminal.draw(|frame| {
-            rendered = ui::render(frame, browser, size);
-        })?;
-        let mut output = self.output.take()?;
-        for hyperlink in &rendered.hyperlinks {
-            append_terminal_hyperlink(&mut output, hyperlink);
-        }
-        if !output.is_empty() {
-            self.handle
-                .data(self.channel, output)
-                .await
-                .map_err(|_| ActorError::OutputClosed)?;
-        }
-        Ok(rendered.comment_candidates)
+        Ok(self.output.draw(|frame| ui::render(frame, browser, size))?)
     }
-
-    async fn finish(&mut self) {
-        let _ = self.handle.data(self.channel, LEAVE_SCREEN.to_vec()).await;
-        let _ = self.handle.exit_status_request(self.channel, 0).await;
-        let _ = self.handle.eof(self.channel).await;
-        let _ = self.handle.close(self.channel).await;
-    }
-}
-
-fn append_terminal_hyperlink(output: &mut Vec<u8>, hyperlink: &ui::TerminalHyperlink) {
-    let position = format!(
-        "\x1b[{};{}H",
-        hyperlink.row.saturating_add(1),
-        hyperlink.column.saturating_add(1)
-    );
-    output.extend_from_slice(position.as_bytes());
-    output.extend_from_slice(b"\x1b]8;;");
-    output.extend_from_slice(hyperlink.destination.as_bytes());
-    output.extend_from_slice(b"\x1b\\\x1b[34;4m");
-    output.extend_from_slice(hyperlink.text.as_bytes());
-    output.extend_from_slice(b"\x1b]8;;\x1b\\\x1b[0m");
-}
-
-fn spawn_session_actor(
-    channel: ChannelId,
-    size: TerminalSize,
-    source: Arc<dyn ContentSource>,
-    handle: server::Handle,
-) -> (UnboundedSender<ActorEvent>, JoinHandle<()>) {
-    let (event_sender, event_receiver) = unbounded_channel();
-    let actor_events = event_sender.clone();
-    let task = tokio::spawn(async move {
-        let result = match SessionActor::new(channel, size, source, handle) {
-            Ok(actor) => actor.run(event_receiver, actor_events).await,
-            Err(error) => Err(error),
-        };
-        if let Err(error) = result {
-            debug!(%error, "browsing session actor ended with an error");
-        }
-    });
-    (event_sender, task)
 }
 
 #[derive(Clone)]
@@ -780,26 +731,32 @@ struct QueuedInput {
     _capacity: OwnedSemaphorePermit,
 }
 
-fn spawn_input_decoder(events: UnboundedSender<ActorEvent>) -> (InputSender, JoinHandle<()>) {
+fn input_decoder(
+    events: Sender<Key>,
+    stop: CancellationToken,
+) -> (InputSender, impl std::future::Future<Output = ()> + Send) {
     let (packets, mut queued): (Sender<QueuedInput>, Receiver<QueuedInput>) =
         channel(INPUT_QUEUE_PACKETS);
     let input = InputSender {
         packets,
         capacity: Arc::new(Semaphore::new(INPUT_QUEUE_BYTES)),
     };
-    let task = tokio::spawn(async move {
+    let task = async move {
         let mut decoder = InputDecoder::default();
         loop {
             let packet = if decoder.is_waiting_for_escape_key() {
                 tokio::select! {
                     biased;
+                    _ = stop.cancelled() => break,
                     _ = events.closed() => break,
                     packet = queued.recv() => packet,
                     _ = tokio::time::sleep(INPUT_ESCAPE_TIMEOUT) => {
-                        if let Some(key) = decoder.expire_escape_key()
-                            && events.send(ActorEvent::Input(key)).is_err()
-                        {
-                            break;
+                        if let Some(key) = decoder.expire_escape_key() {
+                            tokio::select! {
+                                biased;
+                                _ = stop.cancelled() => break,
+                                sent = events.send(key) => if sent.is_err() { break; },
+                            }
                         }
                         continue;
                     }
@@ -807,6 +764,7 @@ fn spawn_input_decoder(events: UnboundedSender<ActorEvent>) -> (InputSender, Joi
             } else {
                 tokio::select! {
                     biased;
+                    _ = stop.cancelled() => break,
                     _ = events.closed() => break,
                     packet = queued.recv() => packet,
                 }
@@ -815,12 +773,14 @@ fn spawn_input_decoder(events: UnboundedSender<ActorEvent>) -> (InputSender, Joi
                 break;
             };
             for key in decoder.push(&bytes) {
-                if events.send(ActorEvent::Input(key)).is_err() {
-                    return;
+                tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => return,
+                    sent = events.send(key) => if sent.is_err() { return; },
                 }
             }
         }
-    });
+    };
     (input, task)
 }
 
@@ -833,13 +793,23 @@ struct BrowsingSession {
     content: Arc<dyn ContentSource>,
     input_rate: InputRateLimiter,
     input: Option<InputSender>,
-    input_task: Option<JoinHandle<()>>,
-    events: Option<UnboundedSender<ActorEvent>>,
-    actor: Option<JoinHandle<()>>,
+    input_done: Option<oneshot::Receiver<()>>,
+    input_stop: CancellationToken,
+    sizes: Option<watch::Sender<TerminalSize>>,
+    output_channel: Option<ChannelWriteHalf<server::Msg>>,
+    stop: CancellationToken,
+    ended: CancellationToken,
+    channel_closed: CancellationToken,
+    input_excess: Arc<AtomicBool>,
+    tasks: Arc<Mutex<JoinSet<()>>>,
 }
 
 impl BrowsingSession {
-    fn new(content: Arc<dyn ContentSource>, progress: watch::Sender<SetupProgress>) -> Self {
+    fn new(
+        content: Arc<dyn ContentSource>,
+        progress: watch::Sender<SetupProgress>,
+        scope: &SessionScope,
+    ) -> Self {
         Self {
             progress,
             channel: None,
@@ -849,9 +819,15 @@ impl BrowsingSession {
             content,
             input_rate: InputRateLimiter::new(),
             input: None,
-            input_task: None,
-            events: None,
-            actor: None,
+            input_done: None,
+            input_stop: scope.stop.child_token(),
+            sizes: None,
+            output_channel: None,
+            stop: scope.stop.clone(),
+            ended: scope.ended.clone(),
+            channel_closed: scope.channel_closed.clone(),
+            input_excess: Arc::new(AtomicBool::new(false)),
+            tasks: Arc::clone(&scope.tasks),
         }
     }
 
@@ -866,22 +842,60 @@ impl BrowsingSession {
     ) -> Result<(), SessionError> {
         let size = self.pty_size.unwrap_or(DEFAULT_SESSION_SIZE);
         self.shell_started = true;
-        session.data(channel, ENTER_SCREEN.to_vec())?;
-        let (events, actor) =
-            spawn_session_actor(channel, size, Arc::clone(&self.content), session.handle());
-        let (input, input_task) = spawn_input_decoder(events.clone());
+        let output_channel = self
+            .output_channel
+            .take()
+            .expect("accepted session channel");
+        let actor = match SessionActor::new(
+            output_channel,
+            size,
+            Arc::clone(&self.content),
+            session.handle(),
+        ) {
+            Ok(actor) => actor,
+            Err(error) => {
+                debug!(%error, "could not initialize terminal");
+                session.data(channel, crate::terminal_output::LEAVE_SCREEN.to_vec())?;
+                return self.finish_without_actor(channel, 1, session);
+            }
+        };
+        let (keys, receiver) = tokio::sync::mpsc::channel(INPUT_QUEUE_KEYS);
+        let (sizes, size_changes) = watch::channel(size);
+        let (input, decoder) = input_decoder(keys, self.input_stop.clone());
+        let (done, input_done) = oneshot::channel();
+        let stop = self.stop.clone();
+        let ended = self.ended.clone();
+        let input_excess = Arc::clone(&self.input_excess);
+        {
+            let mut tasks = self.tasks.lock().expect("session task scope");
+            if self.stop.is_cancelled() {
+                // Teardown may race a late shell callback in Russh's task.
+                // Checking under the scope lock prevents spawning past drain.
+                drop(tasks);
+                return self.finish_without_actor(channel, 1, session);
+            }
+            tasks.spawn(async move {
+                decoder.await;
+                let _ = done.send(());
+            });
+            tasks.spawn(async move {
+                if let Err(error) = actor.run(receiver, size_changes, stop, input_excess).await {
+                    debug!(%error, "browsing session actor ended with an error");
+                }
+                ended.cancel();
+            });
+        }
         self.input = Some(input);
-        self.input_task = Some(input_task);
-        self.events = Some(events);
-        self.actor = Some(actor);
+        self.input_done = Some(input_done);
+        self.sizes = Some(sizes);
         self.progress.send_replace(SetupProgress::ShellStarted);
         Ok(())
     }
 
     fn resize(&mut self, size: TerminalSize) {
         self.pty_size = Some(size);
-        if let Some(events) = &self.events {
-            let _ = events.send(ActorEvent::Resize(size));
+        if let Some(sizes) = &self.sizes {
+            sizes.send_replace(size);
         }
     }
 
@@ -909,23 +923,16 @@ impl BrowsingSession {
         if self.closed {
             return Ok(());
         }
-        self.closed = true;
+        self.input_excess.store(true, Ordering::Relaxed);
         self.abort_input();
-        self.stop_actor();
-        if let Some(actor) = self.actor.take() {
-            actor.abort();
-        }
-        let mut message = if self.shell_started {
-            LEAVE_SCREEN.to_vec()
+        if self.shell_started {
+            self.closed = true;
+            self.stop_actor();
+            Ok(())
         } else {
-            Vec::new()
-        };
-        message.extend_from_slice(INPUT_RATE_LIMIT_MESSAGE);
-        session.data(channel, message)?;
-        session.exit_status_request(channel, 1)?;
-        session.eof(channel)?;
-        session.close(channel)?;
-        Ok(())
+            session.data(channel, INPUT_RATE_LIMIT_MESSAGE.to_vec())?;
+            self.finish_without_actor(channel, 1, session)
+        }
     }
 
     fn charge_inbound_bytes(
@@ -950,25 +957,20 @@ impl BrowsingSession {
 
     async fn drain_input(&mut self) {
         self.input.take();
-        if let Some(mut task) = self.input_task.take()
-            && timeout(INPUT_DRAIN_TIMEOUT, &mut task).await.is_err()
+        if let Some(done) = self.input_done.take()
+            && timeout(INPUT_DRAIN_TIMEOUT, done).await.is_err()
         {
-            task.abort();
-            let _ = task.await;
+            self.input_stop.cancel();
         }
     }
 
     fn abort_input(&mut self) {
         self.input.take();
-        if let Some(task) = self.input_task.take() {
-            task.abort();
-        }
+        self.input_stop.cancel();
     }
 
     fn stop_actor(&mut self) {
-        if let Some(events) = self.events.take() {
-            let _ = events.send(ActorEvent::Stop);
-        }
+        self.stop.cancel();
     }
 }
 
@@ -976,9 +978,6 @@ impl Drop for BrowsingSession {
     fn drop(&mut self) {
         self.abort_input();
         self.stop_actor();
-        if let Some(actor) = self.actor.take() {
-            actor.abort();
-        }
     }
 }
 
@@ -1007,6 +1006,8 @@ impl Handler for BrowsingSession {
                 .await;
         } else {
             self.channel = Some(channel.id());
+            let (_, output) = channel.split();
+            self.output_channel = Some(output);
             reply.accept().await;
         }
         Ok(())
@@ -1272,6 +1273,7 @@ impl Handler for BrowsingSession {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if self.owns_channel(channel) {
+            self.channel_closed.cancel();
             self.closed = true;
             self.abort_input();
             self.stop_actor();
@@ -1360,8 +1362,9 @@ mod tests {
 
     #[tokio::test]
     async fn input_decoder_stops_when_the_actor_event_receiver_closes() {
-        let (events, actor_events) = unbounded_channel();
-        let (input, task) = spawn_input_decoder(events);
+        let (events, actor_events) = channel(INPUT_QUEUE_KEYS);
+        let (input, decoder) = input_decoder(events, CancellationToken::new());
+        let task = tokio::spawn(decoder);
         drop(actor_events);
 
         timeout(Duration::from_secs(1), task)
@@ -1369,24 +1372,5 @@ mod tests {
             .expect("input decoder did not observe actor termination")
             .expect("input decoder task failed");
         assert!(!input.send(b"j".to_vec()).await);
-    }
-
-    #[test]
-    fn terminal_hyperlink_uses_osc_8_and_one_based_coordinates() {
-        let mut output = Vec::new();
-        append_terminal_hyperlink(
-            &mut output,
-            &ui::TerminalHyperlink {
-                column: 1,
-                row: 3,
-                text: "https://example.com/story".to_owned(),
-                destination: "https://example.com/story".to_owned(),
-            },
-        );
-
-        assert_eq!(
-            output,
-            b"\x1b[4;2H\x1b]8;;https://example.com/story\x1b\\\x1b[34;4mhttps://example.com/story\x1b]8;;\x1b\\\x1b[0m"
-        );
     }
 }

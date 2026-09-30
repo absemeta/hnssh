@@ -35,6 +35,8 @@ A client must request an interactive PTY. If automatic PTY allocation is unavail
 
 Each connection permits one session channel, one PTY, and one shell request. Commands, subsystems, environment changes, agent/X11 forwarding, and TCP/Unix-socket forwarding are rejected. Identification, key exchange, and authentication have a ten-second deadline; authenticated clients then have ten seconds to establish the PTY and shell. Established browsing sessions are not subject to those setup deadlines.
 
+Viewports are capped at 300 columns by 120 rows; zero resize dimensions preserve the last usable size. Slow readers retain only the latest pending complete screen, with SSH-window-aware output and diffs based on the last submitted screen. The browsing actor never waits for output. If TCP writes themselves stall, an independent two-second write-episode budget closes the affected connection and cancels its work, even when SSH callbacks cannot run; partial progress does not extend that budget. This is an output-failure bound, not an idle or session-lifetime policy. Disconnects cancel browsing-session work, and graceful exits attempt terminal restoration before exit status, EOF, and close; restoration cannot be guaranteed after transport loss or against an unwritable peer.
+
 Russh is pinned with a narrow local protocol-reply patch; see [`vendor/russh/PATCHES.md`](vendor/russh/PATCHES.md) for provenance and the upgrade/removal checklist.
 
 ## Verify
@@ -43,4 +45,4 @@ Russh is pinned with a narrow local protocol-reply patch; see [`vendor/russh/PAT
 cargo test
 ```
 
-The test suite drives the real SSH transport against an emulated terminal and fake HTTP endpoint to verify anonymous browsing, bounded acquisition, failures, rich content, comment navigation, terminal lifecycle, and protocol behavior. Focused state tests cover comment-thread depth and loaded-node limits.
+The test suite drives the real SSH transport against an emulated terminal and fake HTTP endpoint to verify anonymous browsing, bounded acquisition, failures, rich content, comment navigation, terminal lifecycle, and protocol behavior. Output tests freeze encrypted transport reads with both small SSH windows and large SSH credit plus constrained TCP buffering to verify actual flow-control backpressure, TCP write stalls, screen recovery, resize storms, cancellation, and healthy-visitor isolation. Focused state tests cover comment-thread depth and loaded-node limits.

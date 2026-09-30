@@ -27,6 +27,9 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/ssh_output.rs"]
+mod output_acceptance;
+
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -2230,7 +2233,7 @@ async fn cache_weight_cap_evicts_large_inactive_records() -> TestResult {
 }
 
 #[tokio::test]
-async fn transport_loss_cancels_in_flight_session_comment_loads() -> TestResult {
+async fn ssh_disconnect_cancels_in_flight_session_comment_loads() -> TestResult {
     let started = Arc::new(AtomicUsize::new(0));
     let cancelled = Arc::new(AtomicUsize::new(0));
     let content = Arc::new(PendingCommentContent {

@@ -4,6 +4,8 @@ mod content_safety;
 mod hacker_news;
 mod input;
 mod server;
+mod ssh_transport;
+mod terminal_output;
 mod thread;
 mod ui;
 
