@@ -8,9 +8,9 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
+use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::{Position, Rect, Size};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use russh::ChannelWriteHalf;
 use russh::server;
@@ -19,6 +19,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+use crate::panic_reporting::report_join_error;
 use crate::ui::{RenderOutput, TerminalHyperlink};
 
 // ST closes a possibly partial OSC from a cancelled frame; explicitly close
@@ -26,6 +27,85 @@ use crate::ui::{RenderOutput, TerminalHyperlink};
 pub(crate) const LEAVE_SCREEN: &[u8] = b"\x1b\\\x1b]8;;\x1b\\\x1b[0m\x1b[?25h\x1b[?1049l";
 const ENTER_SCREEN: &[u8] = b"\x1b[?1049h\x1b[0m\x1b[2J\x1b[H\x1b[?25l";
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Ratatui backend that reports the browsing session's viewport instead of
+/// querying the process terminal.
+///
+/// Ratatui consults [`Backend::size`] while resizing a fixed viewport, so the
+/// plain `CrosstermBackend` would reach for the server process's TTY, which
+/// does not exist under systemd, in CI, or in the test harness. Reporting the
+/// viewport keeps every render and resize independent of any process terminal.
+struct ViewportBackend {
+    inner: CrosstermBackend<io::Sink>,
+    size: Size,
+}
+
+impl ViewportBackend {
+    fn new(area: Rect) -> Self {
+        Self {
+            inner: CrosstermBackend::new(io::sink()),
+            size: area.as_size(),
+        }
+    }
+
+    fn set_viewport(&mut self, area: Rect) {
+        self.size = area.as_size();
+    }
+}
+
+impl Backend for ViewportBackend {
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        self.inner.draw(content)
+    }
+
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.inner.append_lines(n)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        Ok(self.size)
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        Ok(WindowSize {
+            columns_rows: self.size,
+            pixels: Size::new(0, 0),
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 struct CompleteFrame {
     cells: Buffer,
@@ -36,9 +116,9 @@ struct CompleteFrame {
 pub(crate) struct TerminalOutput {
     // Sink deliberately discards Ratatui's local diffs: the writer must diff
     // against its delivered baseline, not the actor's most recent render.
-    terminal: Terminal<CrosstermBackend<io::Sink>>,
+    terminal: Terminal<ViewportBackend>,
     pending: watch::Sender<Option<Arc<CompleteFrame>>>,
-    finish: Option<oneshot::Sender<(u32, &'static [u8])>>,
+    finish: Option<oneshot::Sender<(u32, Vec<u8>)>>,
     writer: JoinSet<()>,
     failed: CancellationToken,
     viewport_revision: u64,
@@ -51,7 +131,7 @@ impl TerminalOutput {
         handle: server::Handle,
     ) -> io::Result<Self> {
         let terminal = Terminal::with_options(
-            CrosstermBackend::new(io::sink()),
+            ViewportBackend::new(area),
             TerminalOptions {
                 viewport: Viewport::Fixed(area),
             },
@@ -82,6 +162,7 @@ impl TerminalOutput {
         // Even a resize away and back while blocked invalidates the physical
         // screen, though the writer may never observe the intermediate size.
         self.viewport_revision = self.viewport_revision.wrapping_add(1);
+        self.terminal.backend_mut().set_viewport(area);
         self.terminal.resize(area)
     }
 
@@ -99,12 +180,16 @@ impl TerminalOutput {
         Ok(output.comment_candidates)
     }
 
-    pub(crate) async fn finish(&mut self, status: u32, notice: &'static [u8]) {
+    pub(crate) async fn finish(&mut self, status: u32, notice: Vec<u8>) {
         self.pending.send_replace(None);
         if let Some(finish) = self.finish.take() {
             let _ = finish.send((status, notice));
         }
-        while self.writer.join_next().await.is_some() {}
+        while let Some(joined) = self.writer.join_next().await {
+            if let Err(error) = joined {
+                report_join_error(error, "terminal_output");
+            }
+        }
     }
 }
 
@@ -112,7 +197,7 @@ async fn write_frames(
     channel: ChannelWriteHalf<server::Msg>,
     handle: server::Handle,
     mut frames: watch::Receiver<Option<Arc<CompleteFrame>>>,
-    mut finished: oneshot::Receiver<(u32, &'static [u8])>,
+    mut finished: oneshot::Receiver<(u32, Vec<u8>)>,
     failed: CancellationToken,
 ) {
     let mut previous: Option<Arc<CompleteFrame>> = None;
@@ -120,9 +205,9 @@ async fn write_frames(
     let (status, notice) = loop {
         let next = tokio::select! {
             biased;
-            status = &mut finished => break status.unwrap_or((1, b"")),
+            status = &mut finished => break status.unwrap_or((1, Vec::new())),
             changed = frames.changed() => {
-                if changed.is_err() { break (1, b"".as_slice()); }
+                if changed.is_err() { break (1, Vec::new()); }
                 frames.borrow_and_update().clone()
             }
         };
@@ -131,7 +216,7 @@ async fn write_frames(
             Ok(bytes) => bytes,
             Err(_) => {
                 failed.cancel();
-                break (1, b"".as_slice());
+                break (1, Vec::new());
             }
         };
         // ChannelWriteHalf, unlike Handle::data, reserves the peer's SSH
@@ -139,12 +224,12 @@ async fn write_frames(
         // therefore contains bounded packets, not arbitrarily large frames.
         let sent = tokio::select! {
             biased;
-            status = &mut finished => break status.unwrap_or((1, b"")),
+            status = &mut finished => break status.unwrap_or((1, Vec::new())),
             sent = channel.data_bytes(bytes) => sent,
         };
         if sent.is_err() {
             failed.cancel();
-            break (1, b"".as_slice());
+            break (1, Vec::new());
         }
         entering = false;
         previous = Some(next);
@@ -157,7 +242,7 @@ async fn write_frames(
     let id = channel.id();
     let _ = timeout(CLEANUP_TIMEOUT, async {
         let mut restoration = LEAVE_SCREEN.to_vec();
-        restoration.extend_from_slice(notice);
+        restoration.extend_from_slice(&notice);
         let _ = handle.data(id, restoration).await;
         let _ = handle.exit_status_request(id, status).await;
         let _ = handle.eof(id).await;

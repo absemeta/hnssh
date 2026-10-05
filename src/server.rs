@@ -11,20 +11,25 @@ use russh::keys::{PrivateKey, load_secret_key};
 use russh::server::{self, Auth, Handler, Session};
 use russh::{Channel, ChannelId, ChannelOpenFailure, ChannelWriteHalf, Disconnect, MethodSet, Pty};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, sleep_until, timeout, timeout_at};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::debug;
 
+use crate::admission::{
+    Admission, AdmissionError, AdmissionLimits, ConnectionAdmission, SessionAdmission,
+};
 use crate::browser::{Browser, CommandOutcome, ContentUpdate, FeedEntryLoad};
 use crate::content::{
     Comment, ContentError, ContentSnapshot, ContentSource, FeedEntry, FeedEntryId,
 };
 use crate::hacker_news::HackerNewsContent;
 use crate::input::{InputDecoder, Key};
+use crate::panic_reporting::report_join_error;
 use crate::ssh_transport::SshTransport;
 use crate::terminal_output::TerminalOutput;
 use crate::thread::{CommentLoad, CommentUpdate};
@@ -52,16 +57,38 @@ const SETUP_TIMEOUT_REASON: &str =
     "HNSSH requires a PTY and shell within 10 seconds. Reconnect with: ssh -t <hostname>";
 const TOP_FEED_PAGE_SIZE: usize = 30;
 const PAGE_ITEM_CONCURRENCY: usize = 8;
+const REJECTION_CONCURRENCY: usize = 32;
+const MAX_CONFIGURED_SESSION_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 const PTY_REQUIRED_MESSAGE: &[u8] =
     b"HNSSH requires an interactive terminal.\r\nReconnect with: ssh -t <hostname>\r\n";
+const BUSY_MESSAGE: &[u8] = b"HNSSH is busy. Please try again shortly.\r\n";
 const INPUT_RATE_LIMIT_MESSAGE: &[u8] =
     b"HNSSH closed this browsing session because its input rate stayed above 8 KiB/s.\r\n";
+
+#[derive(Clone, Debug)]
+pub struct SessionTimeouts {
+    pub input_idle: Duration,
+    pub maximum_lifetime: Duration,
+    pub warning_lead: Duration,
+}
+
+impl Default for SessionTimeouts {
+    fn default() -> Self {
+        Self {
+            input_idle: Duration::from_secs(15 * 60),
+            maximum_lifetime: Duration::from_secs(2 * 60 * 60),
+            warning_lead: Duration::from_secs(60),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub listen_address: SocketAddr,
     pub host_key_path: PathBuf,
+    pub admission_limits: AdmissionLimits,
+    pub session_timeouts: SessionTimeouts,
 }
 
 #[derive(Debug, Error)]
@@ -80,12 +107,18 @@ pub enum ServerError {
     },
     #[error("could not accept an SSH connection")]
     Accept(#[source] io::Error),
+    #[error(transparent)]
+    Admission(#[from] AdmissionError),
+    #[error("invalid session timeout configuration: {0}")]
+    InvalidSessionTimeout(&'static str),
 }
 
 pub struct Server {
     listener: TcpListener,
     ssh_config: Arc<server::Config>,
     content: Arc<dyn ContentSource>,
+    admission: Admission,
+    session_timeouts: SessionTimeouts,
 }
 
 impl Server {
@@ -103,6 +136,8 @@ impl Server {
                 source,
             }
         })?;
+        validate_session_timeouts(&config.session_timeouts)?;
+        let admission = Admission::new(config.admission_limits)?;
         let listener = TcpListener::bind(config.listen_address)
             .await
             .map_err(|source| ServerError::Bind {
@@ -114,6 +149,8 @@ impl Server {
             listener,
             ssh_config: ssh_config(host_key),
             content,
+            admission,
+            session_timeouts: config.session_timeouts,
         })
     }
 
@@ -123,6 +160,9 @@ impl Server {
 
     pub async fn run(self, shutdown: CancellationToken) -> Result<(), ServerError> {
         let mut sessions = JoinSet::new();
+        let mut rejections = JoinSet::new();
+        let mut admission_cleanup = interval(self.admission.cleanup_interval());
+        admission_cleanup.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -131,15 +171,45 @@ impl Server {
                 Some(joined) = sessions.join_next(), if !sessions.is_empty() => {
                     report_session_result(joined);
                 }
+                Some(joined) = rejections.join_next(), if !rejections.is_empty() => {
+                    if let Err(error) = joined {
+                        report_join_error(error, "busy_rejection");
+                    }
+                }
+                _ = admission_cleanup.tick() => self.admission.prune_expired(),
                 accepted = self.listener.accept() => {
-                    let (stream, _) = accepted.map_err(ServerError::Accept)?;
+                    let (stream, peer) = accepted.map_err(ServerError::Accept)?;
+                    let Some(connection_admission) = self.admission.admit(peer) else {
+                        if rejections.len() < REJECTION_CONCURRENCY {
+                            rejections.spawn(reject_busy(stream));
+                        } else {
+                            reject_busy_immediately(stream);
+                        }
+                        continue;
+                    };
                     let ssh_config = Arc::clone(&self.ssh_config);
                     let content = Arc::clone(&self.content);
                     let session_shutdown = shutdown.child_token();
+                    let session_timeouts = self.session_timeouts.clone();
                     sessions.spawn(async move {
-                        run_connection(ssh_config, stream, content, session_shutdown).await
+                        run_connection(
+                            ssh_config,
+                            stream,
+                            content,
+                            session_shutdown,
+                            connection_admission,
+                            session_timeouts,
+                        )
+                        .await
                     });
                 }
+            }
+        }
+
+        rejections.abort_all();
+        while let Some(joined) = rejections.join_next().await {
+            if let Err(error) = joined {
+                report_join_error(error, "busy_rejection");
             }
         }
 
@@ -152,11 +222,61 @@ impl Server {
         .is_err()
         {
             sessions.abort_all();
-            while sessions.join_next().await.is_some() {}
+            while let Some(joined) = sessions.join_next().await {
+                report_session_result(joined);
+            }
         }
 
         Ok(())
     }
+}
+
+fn validate_session_timeouts(timeouts: &SessionTimeouts) -> Result<(), ServerError> {
+    if timeouts.input_idle.is_zero() {
+        return Err(ServerError::InvalidSessionTimeout(
+            "input_idle must be greater than zero",
+        ));
+    }
+    if timeouts.maximum_lifetime.is_zero() {
+        return Err(ServerError::InvalidSessionTimeout(
+            "maximum_lifetime must be greater than zero",
+        ));
+    }
+    if timeouts.warning_lead.is_zero() {
+        return Err(ServerError::InvalidSessionTimeout(
+            "warning_lead must be greater than zero",
+        ));
+    }
+    if timeouts.input_idle > MAX_CONFIGURED_SESSION_TIMEOUT
+        || timeouts.maximum_lifetime > MAX_CONFIGURED_SESSION_TIMEOUT
+    {
+        return Err(ServerError::InvalidSessionTimeout(
+            "timeout periods must not exceed seven days",
+        ));
+    }
+    if timeouts.warning_lead >= timeouts.input_idle
+        || timeouts.warning_lead >= timeouts.maximum_lifetime
+    {
+        return Err(ServerError::InvalidSessionTimeout(
+            "warning_lead must be shorter than both timeout periods",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_busy_immediately(stream: TcpStream) {
+    let _ = stream.try_write(BUSY_MESSAGE);
+}
+
+async fn reject_busy(mut stream: TcpStream) {
+    // The caller admits this work only through a fixed-size JoinSet. Excess
+    // peers therefore cannot create an unbounded task/buffer queue, and one
+    // unwritable arrival cannot serialize later accepts.
+    let _ = timeout(Duration::from_millis(100), async {
+        stream.write_all(BUSY_MESSAGE).await?;
+        stream.shutdown().await
+    })
+    .await;
 }
 
 fn ssh_config(host_key: PrivateKey) -> Arc<server::Config> {
@@ -175,6 +295,8 @@ async fn run_connection(
     stream: TcpStream,
     content: Arc<dyn ContentSource>,
     shutdown: CancellationToken,
+    admission: ConnectionAdmission,
+    session_timeouts: SessionTimeouts,
 ) -> Result<(), SessionError> {
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     // run_stream only exchanges identification before spawning russh's task; dropping
@@ -184,12 +306,21 @@ async fn run_connection(
     let transport = CloseTransport(socket.try_clone()?);
     let stream = SshTransport::new(TcpStream::from_std(socket)?);
     let scope = SessionScope::new();
+    let session_admission = admission.session_admission();
     let (progress, mut changes) = watch::channel(SetupProgress::Authenticating);
     let running = tokio::select! {
         biased;
         _ = shutdown.cancelled() => return Ok(()),
         result = timeout_at(handshake_deadline, server::run_stream(
-            config, stream, BrowsingSession::new(content, progress, &scope),
+            config,
+            stream,
+            BrowsingSession::new(
+                content,
+                progress,
+                &scope,
+                session_admission,
+                session_timeouts,
+            ),
         )) => match result {
             Ok(result) => result?,
             // Before identification/key exchange there is no usable encrypted channel.
@@ -199,13 +330,12 @@ async fn run_connection(
     let handle = running.handle();
     tokio::pin!(running);
 
-    let mut actor_finished = false;
-    let mut close_deadline = None;
     let reason = loop {
         let (deadline, reason) = match *changes.borrow_and_update() {
             SetupProgress::Authenticating => (Some(handshake_deadline), HANDSHAKE_TIMEOUT_REASON),
             SetupProgress::Authenticated(at) => (Some(at + SETUP_TIMEOUT), SETUP_TIMEOUT_REASON),
-            SetupProgress::ShellStarted => (close_deadline, "HNSSH browsing session ended"),
+            SetupProgress::ShellStarted => (None, "HNSSH browsing session ended"),
+            SetupProgress::Closing(reason) => (Some(Instant::now()), reason),
         };
         tokio::select! {
             biased;
@@ -214,15 +344,8 @@ async fn run_connection(
                 scope.drain().await;
                 return result;
             },
-            _ = scope.ended.cancelled(), if !actor_finished => {
-                actor_finished = true;
-                if !scope.channel_closed.is_cancelled() {
-                    close_deadline = Some(Instant::now() + SESSION_DRAIN_TIMEOUT);
-                }
-            },
-            _ = scope.channel_closed.cancelled(), if close_deadline.is_some() => {
-                close_deadline = None;
-            },
+            _ = scope.ended.cancelled() => break "HNSSH browsing session ended",
+            _ = scope.channel_closed.cancelled() => break "HNSSH browsing session ended",
             Ok(()) = changes.changed() => continue,
             _ = async {
                 match deadline {
@@ -277,7 +400,11 @@ impl SessionScope {
     async fn drain(&self) {
         self.stop.cancel();
         let mut tasks = std::mem::take(&mut *self.tasks.lock().expect("session task scope"));
-        while tasks.join_next().await.is_some() {}
+        while let Some(joined) = tasks.join_next().await {
+            if let Err(error) = joined {
+                report_join_error(error, "browsing_session");
+            }
+        }
     }
 }
 
@@ -301,14 +428,14 @@ enum SetupProgress {
     Authenticating,
     Authenticated(Instant),
     ShellStarted,
+    Closing(&'static str),
 }
 
 fn report_session_result(joined: Result<Result<(), SessionError>, tokio::task::JoinError>) {
     match joined {
         Ok(Ok(())) => debug!("browsing session ended"),
         Ok(Err(error)) => debug!(%error, "browsing session ended with an error"),
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => warn!(%error, "browsing session task failed"),
+        Err(error) => report_join_error(error, "ssh_connection"),
     }
 }
 
@@ -432,6 +559,127 @@ enum ActorError {
     OutputClosed,
     #[error("session input rate exceeded")]
     InputExcess,
+    #[error("browsing session reached its input-idle timeout")]
+    InputIdleTimeout,
+    #[error("browsing session reached its maximum lifetime")]
+    MaximumLifetime,
+    #[error("configured session deadline is outside the runtime clock range")]
+    ClockRange,
+}
+
+#[derive(Clone)]
+struct IdleActivity {
+    state: Arc<Mutex<IdleActivityState>>,
+    changed: watch::Sender<u64>,
+    timeout: Duration,
+}
+
+struct IdleActivityState {
+    deadline: Instant,
+    last_activity: Instant,
+    revision: u64,
+    expired: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdleSnapshot {
+    Active { now: Instant, deadline: Instant },
+    Expired,
+}
+
+impl IdleActivity {
+    fn new(timeout: Duration) -> Option<(Self, watch::Receiver<u64>)> {
+        Self::new_at(timeout, Instant::now())
+    }
+
+    fn new_at(timeout: Duration, started_at: Instant) -> Option<(Self, watch::Receiver<u64>)> {
+        let deadline = started_at.checked_add(timeout)?;
+        let (changed, changes) = watch::channel(0);
+        Some((
+            Self {
+                state: Arc::new(Mutex::new(IdleActivityState {
+                    deadline,
+                    last_activity: started_at,
+                    revision: 0,
+                    expired: false,
+                })),
+                changed,
+                timeout,
+            },
+            changes,
+        ))
+    }
+
+    fn record(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Taking the timestamp while holding the same lock as expiry makes
+        // input and timeout linearizable at the deadline.
+        let occurred_at = Instant::now();
+        self.record_locked(&mut state, occurred_at)
+    }
+
+    #[cfg(test)]
+    fn record_at(&self, occurred_at: Instant) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.record_locked(&mut state, occurred_at)
+    }
+
+    fn record_locked(&self, state: &mut IdleActivityState, occurred_at: Instant) -> bool {
+        if state.expired || occurred_at < state.last_activity || occurred_at > state.deadline {
+            return false;
+        }
+        let Some(deadline) = occurred_at.checked_add(self.timeout) else {
+            return false;
+        };
+        state.last_activity = occurred_at;
+        state.deadline = deadline;
+        state.revision = state.revision.wrapping_add(1);
+        let revision = state.revision;
+        let _ = self.changed.send_replace(revision);
+        true
+    }
+
+    fn snapshot(&self) -> IdleSnapshot {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        self.snapshot_locked(&mut state, now)
+    }
+
+    #[cfg(test)]
+    fn snapshot_at(&self, now: Instant) -> IdleSnapshot {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.snapshot_locked(&mut state, now)
+    }
+
+    fn snapshot_locked(&self, state: &mut IdleActivityState, now: Instant) -> IdleSnapshot {
+        if state.expired || now >= state.deadline {
+            state.expired = true;
+            IdleSnapshot::Expired
+        } else {
+            IdleSnapshot::Active {
+                now,
+                deadline: state.deadline,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimeoutWarning {
+    InputIdle,
+    MaximumLifetime,
 }
 
 enum ContentJob {
@@ -453,6 +701,8 @@ struct SessionActor {
     pending_loads: VecDeque<ContentJob>,
     browser: Browser,
     output: TerminalOutput,
+    timeouts: SessionTimeouts,
+    timeout_warning: Option<TimeoutWarning>,
 }
 
 impl SessionActor {
@@ -461,6 +711,7 @@ impl SessionActor {
         size: TerminalSize,
         source: Arc<dyn ContentSource>,
         handle: server::Handle,
+        timeouts: SessionTimeouts,
     ) -> Result<Self, ActorError> {
         Ok(Self {
             size,
@@ -471,6 +722,8 @@ impl SessionActor {
             pending_loads: VecDeque::new(),
             browser: Browser::new(),
             output: TerminalOutput::new(size.area(), channel, handle)?,
+            timeouts,
+            timeout_warning: None,
         })
     }
 
@@ -478,23 +731,54 @@ impl SessionActor {
         mut self,
         mut keys: Receiver<Key>,
         mut sizes: watch::Receiver<TerminalSize>,
+        idle_activity: IdleActivity,
+        mut activity_changes: watch::Receiver<u64>,
         stop: CancellationToken,
         input_excess: Arc<AtomicBool>,
     ) -> Result<(), ActorError> {
-        let mut result = self.browse(&mut keys, &mut sizes, &stop).await;
+        let mut result = self
+            .browse(
+                &mut keys,
+                &mut sizes,
+                &idle_activity,
+                &mut activity_changes,
+                &stop,
+            )
+            .await;
         if input_excess.load(Ordering::Relaxed) {
             result = Err(ActorError::InputExcess);
         }
         self.top_feed_task.abort_all();
         self.load_tasks.abort_all();
-        while self.top_feed_task.join_next().await.is_some() {}
-        while self.load_tasks.join_next().await.is_some() {}
-        let notice = if matches!(result, Err(ActorError::InputExcess)) {
-            INPUT_RATE_LIMIT_MESSAGE
-        } else {
-            b""
+        while let Some(joined) = self.top_feed_task.join_next().await {
+            if let Err(error) = joined {
+                report_join_error(error, "session_top_feed");
+            }
+        }
+        while let Some(joined) = self.load_tasks.join_next().await {
+            if let Err(error) = joined {
+                report_join_error(error, "session_content");
+            }
+        }
+        let failed = result.is_err();
+        let notice = match &result {
+            Err(ActorError::InputExcess) => INPUT_RATE_LIMIT_MESSAGE.to_vec(),
+            Err(ActorError::InputIdleTimeout) => format!(
+                "HNSSH closed this browsing session after {} without input. Reconnect to continue.\r\n",
+                duration_label(self.timeouts.input_idle),
+            )
+            .into_bytes(),
+            Err(ActorError::MaximumLifetime) => format!(
+                "HNSSH closed this browsing session at its {} maximum lifetime. Reconnect to continue.\r\n",
+                duration_label(self.timeouts.maximum_lifetime),
+            )
+            .into_bytes(),
+            Ok(())
+            | Err(ActorError::Terminal(_) | ActorError::OutputClosed | ActorError::ClockRange) => {
+                Vec::new()
+            }
         };
-        self.output.finish(u32::from(result.is_err()), notice).await;
+        self.output.finish(u32::from(failed), notice).await;
         result
     }
 
@@ -502,16 +786,50 @@ impl SessionActor {
         &mut self,
         keys: &mut Receiver<Key>,
         sizes: &mut watch::Receiver<TerminalSize>,
+        idle_activity: &IdleActivity,
+        activity_changes: &mut watch::Receiver<u64>,
         stop: &CancellationToken,
     ) -> Result<(), ActorError> {
         self.redraw()?;
         self.pending_top_feed = Some(ContentUpdate::Initial);
         let output_failed = self.output.failed();
+        let started = Instant::now();
+        let lifetime_deadline = started
+            .checked_add(self.timeouts.maximum_lifetime)
+            .ok_or(ActorError::ClockRange)?;
         loop {
             self.start_loads();
+            let (now, idle_deadline) = match idle_activity.snapshot() {
+                IdleSnapshot::Active { now, deadline } => (now, deadline),
+                IdleSnapshot::Expired => return Err(ActorError::InputIdleTimeout),
+            };
+            if now >= lifetime_deadline {
+                return Err(ActorError::MaximumLifetime);
+            }
+            let warning = active_timeout_warning(
+                now,
+                idle_deadline,
+                lifetime_deadline,
+                self.timeouts.warning_lead,
+            );
+            if warning != self.timeout_warning {
+                self.timeout_warning = warning;
+                self.redraw()?;
+            }
+            let timeout_transition = next_timeout_transition(
+                now,
+                idle_deadline,
+                lifetime_deadline,
+                self.timeouts.warning_lead,
+            );
             let event = tokio::select! {
+                biased;
                 _ = stop.cancelled() => return Ok(()),
                 _ = output_failed.cancelled() => return Err(ActorError::OutputClosed),
+                changed = activity_changes.changed() => {
+                    if changed.is_err() { return Ok(()); }
+                    continue;
+                }
                 changed = sizes.changed() => {
                     if changed.is_err() { return Ok(()); }
                     self.size = *sizes.borrow_and_update();
@@ -543,7 +861,7 @@ impl SessionActor {
                     match joined {
                         Some(Ok(event)) => event,
                         Some(Err(error)) => {
-                            debug!(%error, "session top-feed task failed");
+                            report_join_error(error, "session_top_feed");
                             continue;
                         }
                         None => continue,
@@ -553,12 +871,13 @@ impl SessionActor {
                     match joined {
                         Some(Ok(event)) => event,
                         Some(Err(error)) => {
-                            debug!(%error, "session content task failed");
+                            report_join_error(error, "session_content");
                             continue;
                         }
                         None => continue,
                     }
                 }
+                _ = sleep_until(timeout_transition) => continue,
             };
             match event {
                 ActorEvent::TopFeed { result, update } => {
@@ -685,7 +1004,75 @@ impl SessionActor {
     fn render(&mut self) -> Result<Vec<usize>, ActorError> {
         let browser = &mut self.browser;
         let size = self.size.area();
-        Ok(self.output.draw(|frame| ui::render(frame, browser, size))?)
+        let warning = self.timeout_warning.map(|warning| match warning {
+            TimeoutWarning::InputIdle => format!(
+                "WARNING: input-idle timeout in {}; press any key to stay connected",
+                duration_label(self.timeouts.warning_lead),
+            ),
+            TimeoutWarning::MaximumLifetime => format!(
+                "WARNING: maximum session lifetime in {}; reconnect to continue",
+                duration_label(self.timeouts.warning_lead),
+            ),
+        });
+        Ok(self
+            .output
+            .draw(|frame| ui::render(frame, browser, size, warning.as_deref()))?)
+    }
+}
+
+fn active_timeout_warning(
+    now: Instant,
+    idle_deadline: Instant,
+    lifetime_deadline: Instant,
+    warning_lead: Duration,
+) -> Option<TimeoutWarning> {
+    let mut warnings = Vec::new();
+    if idle_deadline
+        .checked_sub(warning_lead)
+        .is_some_and(|warning_at| now >= warning_at)
+    {
+        warnings.push((idle_deadline, TimeoutWarning::InputIdle));
+    }
+    if lifetime_deadline
+        .checked_sub(warning_lead)
+        .is_some_and(|warning_at| now >= warning_at)
+    {
+        warnings.push((lifetime_deadline, TimeoutWarning::MaximumLifetime));
+    }
+    warnings
+        .into_iter()
+        .min_by_key(|(deadline, _)| *deadline)
+        .map(|(_, warning)| warning)
+}
+
+fn next_timeout_transition(
+    now: Instant,
+    idle_deadline: Instant,
+    lifetime_deadline: Instant,
+    warning_lead: Duration,
+) -> Instant {
+    [
+        idle_deadline.checked_sub(warning_lead),
+        Some(idle_deadline),
+        lifetime_deadline.checked_sub(warning_lead),
+        Some(lifetime_deadline),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|transition| *transition > now)
+    .min()
+    .unwrap_or(now)
+}
+
+fn duration_label(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 60 && seconds.is_multiple_of(60) {
+        let minutes = seconds / 60;
+        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    } else if seconds > 0 {
+        format!("{seconds} second{}", if seconds == 1 { "" } else { "s" })
+    } else {
+        format!("{} ms", duration.as_millis())
     }
 }
 
@@ -791,8 +1178,11 @@ struct BrowsingSession {
     shell_started: bool,
     closed: bool,
     content: Arc<dyn ContentSource>,
+    session_admission: SessionAdmission,
+    session_timeouts: SessionTimeouts,
     input_rate: InputRateLimiter,
     input: Option<InputSender>,
+    activity: Option<IdleActivity>,
     input_done: Option<oneshot::Receiver<()>>,
     input_stop: CancellationToken,
     sizes: Option<watch::Sender<TerminalSize>>,
@@ -809,6 +1199,8 @@ impl BrowsingSession {
         content: Arc<dyn ContentSource>,
         progress: watch::Sender<SetupProgress>,
         scope: &SessionScope,
+        session_admission: SessionAdmission,
+        session_timeouts: SessionTimeouts,
     ) -> Self {
         Self {
             progress,
@@ -817,8 +1209,11 @@ impl BrowsingSession {
             shell_started: false,
             closed: false,
             content,
+            session_admission,
+            session_timeouts,
             input_rate: InputRateLimiter::new(),
             input: None,
+            activity: None,
             input_done: None,
             input_stop: scope.stop.child_token(),
             sizes: None,
@@ -839,9 +1234,15 @@ impl BrowsingSession {
         &mut self,
         channel: ChannelId,
         session: &mut Session,
+        session_permit: OwnedSemaphorePermit,
     ) -> Result<(), SessionError> {
         let size = self.pty_size.unwrap_or(DEFAULT_SESSION_SIZE);
         self.shell_started = true;
+        let Some((activity, activity_changes)) =
+            IdleActivity::new(self.session_timeouts.input_idle)
+        else {
+            return self.finish_without_actor(channel, 1, session);
+        };
         let output_channel = self
             .output_channel
             .take()
@@ -851,6 +1252,7 @@ impl BrowsingSession {
             size,
             Arc::clone(&self.content),
             session.handle(),
+            self.session_timeouts.clone(),
         ) {
             Ok(actor) => actor,
             Err(error) => {
@@ -866,6 +1268,7 @@ impl BrowsingSession {
         let stop = self.stop.clone();
         let ended = self.ended.clone();
         let input_excess = Arc::clone(&self.input_excess);
+        let actor_activity = activity.clone();
         {
             let mut tasks = self.tasks.lock().expect("session task scope");
             if self.stop.is_cancelled() {
@@ -879,15 +1282,34 @@ impl BrowsingSession {
                 let _ = done.send(());
             });
             tasks.spawn(async move {
-                if let Err(error) = actor.run(receiver, size_changes, stop, input_excess).await {
+                // Cancellation on drop covers ordinary completion and unwind;
+                // the connection owner can then close even if the actor panics.
+                let _ended = ended.drop_guard();
+                if let Err(error) = actor
+                    .run(
+                        receiver,
+                        size_changes,
+                        actor_activity,
+                        activity_changes,
+                        stop,
+                        input_excess,
+                    )
+                    .await
+                {
                     debug!(%error, "browsing session actor ended with an error");
                 }
-                ended.cancel();
             });
         }
         self.input = Some(input);
+        self.activity = Some(activity);
         self.input_done = Some(input_done);
         self.sizes = Some(sizes);
+        if !self.session_admission.establish(session_permit) {
+            self.stop_actor();
+            self.progress
+                .send_replace(SetupProgress::Closing("HNSSH browsing session ended"));
+            return Ok(());
+        }
         self.progress.send_replace(SetupProgress::ShellStarted);
         Ok(())
     }
@@ -909,6 +1331,8 @@ impl BrowsingSession {
             return Ok(());
         }
         self.closed = true;
+        self.progress
+            .send_replace(SetupProgress::Closing("HNSSH browsing session ended"));
         session.exit_status_request(channel, status)?;
         session.eof(channel)?;
         session.close(channel)?;
@@ -1116,7 +1540,14 @@ impl Handler for BrowsingSession {
             return self.finish_without_actor(channel, 1, session);
         }
 
-        self.start_shell(channel, session)
+        let session_permit = match self.session_admission.try_reserve() {
+            Ok(permit) => permit,
+            Err(_) => {
+                session.data(channel, BUSY_MESSAGE.to_vec())?;
+                return self.finish_without_actor(channel, 1, session);
+            }
+        };
+        self.start_shell(channel, session, session_permit)
     }
 
     async fn window_change_request(
@@ -1146,6 +1577,13 @@ impl Handler for BrowsingSession {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if !self.charge_inbound_bytes(channel, data.len(), session)? || !self.shell_started {
+            return Ok(());
+        }
+        if self
+            .activity
+            .as_ref()
+            .is_some_and(|activity| !activity.record())
+        {
             return Ok(());
         }
         if let Some(input) = self.input.clone() {
@@ -1259,10 +1697,13 @@ impl Handler for BrowsingSession {
     ) -> Result<(), Self::Error> {
         if self.owns_channel(channel) && !self.closed {
             self.closed = true;
-            // Data and EOF callbacks are ordered. Closing the bounded input
-            // queue lets its decoder forward every admitted key before Stop.
+            // Data and EOF callbacks are ordered. Keep the actor alive while
+            // closing and draining the bounded decoder queue; only then expose
+            // closing to the connection owner, whose scope drain cancels tasks.
             self.drain_input().await;
             self.stop_actor();
+            self.progress
+                .send_replace(SetupProgress::Closing("HNSSH channel reached EOF"));
         }
         Ok(())
     }
@@ -1275,6 +1716,8 @@ impl Handler for BrowsingSession {
         if self.owns_channel(channel) {
             self.channel_closed.cancel();
             self.closed = true;
+            self.progress
+                .send_replace(SetupProgress::Closing("HNSSH channel closed"));
             self.abort_input();
             self.stop_actor();
         }
@@ -1284,7 +1727,124 @@ impl Handler for BrowsingSession {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    use tracing::instrument::WithSubscriber;
+
     use super::*;
+
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_task_panic_emits_a_category_only_structured_warning() {
+        const PRIVATE_PANIC: &str = "private-scoped-panic-payload";
+        crate::panic_reporting::install_privacy_safe_panic_hook();
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&logs);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedWriter(Arc::clone(&captured)))
+            .finish();
+        let scope = SessionScope::new();
+        scope
+            .tasks
+            .lock()
+            .expect("session task scope")
+            .spawn(async { panic!("{PRIVATE_PANIC}") });
+
+        scope.drain().with_subscriber(subscriber).await;
+
+        let output = String::from_utf8(
+            logs.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+        .expect("UTF-8 logs");
+        assert!(output.contains("asynchronous task failed"));
+        assert!(output.contains("task.scope=\"browsing_session\""));
+        assert!(output.contains("task.failure=\"panic\""));
+        assert!(!output.contains(PRIVATE_PANIC));
+    }
+
+    #[test]
+    fn default_session_timeouts_match_the_public_policy() {
+        let timeouts = SessionTimeouts::default();
+        assert_eq!(timeouts.input_idle, Duration::from_secs(15 * 60));
+        assert_eq!(timeouts.maximum_lifetime, Duration::from_secs(2 * 60 * 60));
+        assert_eq!(timeouts.warning_lead, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn session_timeout_validation_rejects_clock_range_and_warning_errors() {
+        for invalid in [
+            SessionTimeouts {
+                input_idle: MAX_CONFIGURED_SESSION_TIMEOUT + Duration::from_secs(1),
+                ..SessionTimeouts::default()
+            },
+            SessionTimeouts {
+                maximum_lifetime: MAX_CONFIGURED_SESSION_TIMEOUT + Duration::from_secs(1),
+                ..SessionTimeouts::default()
+            },
+            SessionTimeouts {
+                warning_lead: Duration::from_secs(15 * 60),
+                ..SessionTimeouts::default()
+            },
+        ] {
+            assert!(matches!(
+                validate_session_timeouts(&invalid),
+                Err(ServerError::InvalidSessionTimeout(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn idle_activity_is_linearizable_and_preserves_coalesced_pre_deadline_input() {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let (activity, _changes) = IdleActivity::new_at(timeout, start).expect("clock range");
+
+        assert!(activity.record_at(start + Duration::from_secs(9)));
+        // This is after the original deadline but before the deadline extended
+        // by the first event. A watch mailbox could overwrite the first event;
+        // shared deadline state preserves and then extends it again.
+        assert!(activity.record_at(start + Duration::from_secs(11)));
+        assert_eq!(
+            activity.snapshot_at(start + Duration::from_secs(12)),
+            IdleSnapshot::Active {
+                now: start + Duration::from_secs(12),
+                deadline: start + Duration::from_secs(21),
+            }
+        );
+
+        let (input_wins, _) = IdleActivity::new_at(timeout, start).expect("clock range");
+        assert!(input_wins.record_at(start + timeout));
+        assert!(matches!(
+            input_wins.snapshot_at(start + timeout),
+            IdleSnapshot::Active { .. }
+        ));
+
+        let (timeout_wins, _) = IdleActivity::new_at(timeout, start).expect("clock range");
+        assert_eq!(
+            timeout_wins.snapshot_at(start + timeout),
+            IdleSnapshot::Expired
+        );
+        assert!(!timeout_wins.record_at(start + timeout));
+    }
 
     #[test]
     fn protocol_dimensions_are_clamped_without_losing_the_last_usable_size() {

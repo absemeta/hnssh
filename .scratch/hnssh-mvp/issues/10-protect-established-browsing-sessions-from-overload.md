@@ -4,13 +4,23 @@
 
 **Blocked by:** 09 — Harden the SSH and terminal lifecycle.
 
-**Status:** ready-for-agent
+**Status:** complete
 
-- [ ] No more than 32 SSH handshakes and 200 established browsing sessions consume application resources at once.
-- [ ] Excess arrivals receive a short busy response or SSH disconnect reason within their handshake deadline and do not displace established browsing sessions.
-- [ ] Default per-source limits allow eight simultaneous connections and 30 attempts per minute with a burst of ten, and all admission limits are operator-configurable.
-- [ ] A peer address is normalized and transformed immediately for rate limiting; raw addresses are never logged, emitted as metrics, or persisted.
-- [ ] Per-source admission uses hourly derived keyed values held only in memory, and expired buckets disappear promptly after their limiting window.
-- [ ] Browsing sessions have a 15-minute input-idle timeout and a two-hour absolute lifetime, with a one-minute visitor-visible warning when the channel is writable.
-- [ ] Admission permits are released on every handshake error, timeout, channel close, panic, cancellation, and transport-loss path.
-- [ ] Concurrent acceptance tests prove exact global and per-source limits, warning/timeout behavior, prompt permit recovery, clear rejection, and continued navigation for established sessions.
+- [x] No more than 32 SSH handshakes and 200 established browsing sessions consume application resources at once.
+- [x] Excess arrivals receive a short busy response or SSH disconnect reason within their handshake deadline and do not displace established browsing sessions.
+- [x] Default per-source limits allow eight simultaneous connections and 30 attempts per minute with a burst of ten, and all admission limits are operator-configurable.
+- [x] A peer address is normalized and transformed immediately for rate limiting; raw addresses are never logged, emitted as metrics, or persisted.
+- [x] Per-source admission uses hourly derived keyed values held only in memory, and expired buckets disappear promptly after their limiting window.
+- [x] Browsing sessions have a 15-minute input-idle timeout and a two-hour absolute lifetime, with a one-minute visitor-visible warning when the channel is writable.
+- [x] Admission permits are released on every handshake error, timeout, channel close, panic, cancellation, and transport-loss path.
+- [x] Concurrent acceptance tests prove exact global and per-source limits, warning/timeout behavior, prompt permit recovery, clear rejection, and continued navigation for established sessions.
+
+## Implementation notes
+
+`src/admission.rs` is the only application boundary that receives a peer address. It canonicalizes IPv4-mapped addresses, derives an hourly HMAC key from a random process-only root using a monotonic process epoch, and stores only opaque source keys in short-lived token buckets. Rotation carries active counts and rate state across the hour boundary without depending on discontinuous wall time. A periodic runtime sweep removes inactive expired buckets, whose table has a configurable hard cap and no full-table scan on the admission hot path. RAII source, handshake, and browsing permits release during ordinary closure and unwinding. Every live SSH transport retains exactly one global phase permit through bounded teardown; an actor drop guard also wakes connection teardown after panic.
+
+The accept loop rejects source or handshake excess through a separately bounded concurrent response pool before allocating an SSH runtime. Shell establishment atomically transfers a handshake into a connection-owned browsing permit only after the actor is installed; a full browsing pool receives an SSH-channel busy response and bounded disconnect while retaining handshake capacity until teardown. Public configuration and CLI/environment flags cover every global and per-source limit, and startup rejects semaphore overflow, unsafe duration ranges, and rate configurations whose burst could outlive bucket retention.
+
+A shared locked idle-deadline policy linearizes admitted channel data against expiry before input reaches the session actor; coalesced notifications cannot discard an earlier valid reset. The actor owns the absolute-lifetime timer and observes shared idle snapshots alongside its existing bounded input, content, render, and output events. Warning frames are coalesced through the existing latest-frame output path, and timeout closure uses the established ordered restoration/status/EOF/close epilogue with a visitor-facing reason. Scoped task panics and every observed Tokio `JoinError` produce only category-level structured warnings. The process panic hook is installed by the production entry wrapper before tracing setup or Tokio runtime construction and performs a single payload-free low-level stderr write that cannot recurse through a tracing subscriber, stderr lock, or the panic payload itself.
+
+Real-SSH acceptance tests hold exactly 32 incomplete handshakes and 200 established Ratatui sessions, reject the next arrival, navigate already admitted visitors, and demonstrate permit reuse. Additional concurrent cases cover the exact eight-connection source cap, token-bucket burst/refill during global saturation, session overload, transport loss, idle-warning reset and closure, and absolute lifetime despite recent input. Focused tests deterministically cover timestamps straddling idle expiry, monotonic hourly rotation, prompt bucket expiry, address normalization, scoped-task panic reporting, and permit release under unwind. A dedicated integration-test binary isolates structured tracing capture, asserts an allowlisted event-field schema that cannot carry source-key material (complemented by a key-shape canary), runs IPv4 always and IPv6 loopback only when the environment supports it, and launches child processes to verify the production startup ordering, a deliberately panicking tracing writer, and the real binary startup path without hidden panics or payload leakage. The second-source accounting test probes the 127.0.0.2 loopback alias and skips where the platform does not configure it; the deterministic admission unit test covers the exact token accounting on every platform.

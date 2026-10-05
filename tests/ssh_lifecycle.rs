@@ -14,8 +14,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use hnssh::{
-    Comment, CommentDetails, ContentError, ContentSnapshot, ContentSource, EntryDetails, FeedEntry,
-    FeedEntryId, FixtureContent, HackerNewsContent, HackerNewsOptions, Server, ServerConfig,
+    AdmissionLimits, Comment, CommentDetails, ContentError, ContentSnapshot, ContentSource,
+    EntryDetails, FeedEntry, FeedEntryId, FixtureContent, HackerNewsContent, HackerNewsOptions,
+    Server, ServerConfig, ServerError, SessionTimeouts,
 };
 use russh::client;
 use russh::keys::{Algorithm, PrivateKey, ssh_key};
@@ -23,7 +24,7 @@ use russh::{Channel, ChannelMsg, client::AuthResult};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Barrier, Semaphore, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -77,11 +78,26 @@ impl TestServer {
     }
 
     async fn start_with_content(content: Arc<dyn ContentSource>) -> TestResult<Self> {
+        Self::start_with_policy(
+            content,
+            AdmissionLimits::default(),
+            SessionTimeouts::default(),
+        )
+        .await
+    }
+
+    async fn start_with_policy(
+        content: Arc<dyn ContentSource>,
+        admission_limits: AdmissionLimits,
+        session_timeouts: SessionTimeouts,
+    ) -> TestResult<Self> {
         let (key_dir, host_key_path, public_key) = make_host_key()?;
         let server = Server::bind_with_content(
             ServerConfig {
                 listen_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
                 host_key_path,
+                admission_limits,
+                session_timeouts,
             },
             content,
         )
@@ -105,14 +121,34 @@ impl TestServer {
         client::Handle<TrustExpectedHostKey>,
         oneshot::Receiver<String>,
     )> {
+        self.connect_unauthenticated_from(None).await
+    }
+
+    async fn connect_unauthenticated_from(
+        &self,
+        source: Option<Ipv4Addr>,
+    ) -> TestResult<(
+        client::Handle<TrustExpectedHostKey>,
+        oneshot::Receiver<String>,
+    )> {
         let config = Arc::new(client::Config::default());
         let (sender, disconnected) = oneshot::channel();
         let handler = TrustExpectedHostKey {
             expected: self.public_key.clone(),
             disconnected: Some(sender),
         };
-        let connection =
-            timeout(TEST_TIMEOUT, client::connect(config, self.address, handler)).await??;
+        let connection = if let Some(source) = source {
+            let socket = tokio::net::TcpSocket::new_v4()?;
+            socket.bind(SocketAddr::new(IpAddr::V4(source), 0))?;
+            let stream = socket.connect(self.address).await?;
+            timeout(
+                TEST_TIMEOUT,
+                client::connect_stream(config, stream, handler),
+            )
+            .await??
+        } else {
+            timeout(TEST_TIMEOUT, client::connect(config, self.address, handler)).await??
+        };
         Ok((connection, disconnected))
     }
 
@@ -121,6 +157,29 @@ impl TestServer {
         let result: AuthResult = connection.authenticate_none("ignored-visitor-name").await?;
         assert!(result.success(), "none authentication should succeed");
         Ok(connection)
+    }
+
+    async fn connect_unauthenticated_with_socket(
+        &self,
+    ) -> TestResult<(
+        client::Handle<TrustExpectedHostKey>,
+        oneshot::Receiver<String>,
+        std::net::TcpStream,
+    )> {
+        let stream = TcpStream::connect(self.address).await?.into_std()?;
+        let socket = stream.try_clone()?;
+        let stream = TcpStream::from_std(stream)?;
+        let (sender, disconnected) = oneshot::channel();
+        let handler = TrustExpectedHostKey {
+            expected: self.public_key.clone(),
+            disconnected: Some(sender),
+        };
+        let connection = timeout(
+            TEST_TIMEOUT,
+            client::connect_stream(Arc::new(client::Config::default()), stream, handler),
+        )
+        .await??;
+        Ok((connection, disconnected, socket))
     }
 
     async fn stop(self) -> TestResult {
@@ -526,6 +585,28 @@ fn make_host_key() -> TestResult<(TempDir, PathBuf, ssh_key::PublicKey)> {
     Ok((key_dir, path, public_key))
 }
 
+async fn raw_connection_from(server: &TestServer, source: Ipv4Addr) -> TestResult<TcpStream> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.bind(SocketAddr::new(IpAddr::V4(source), 0))?;
+    Ok(socket.connect(server.address).await?)
+}
+
+async fn read_connection_greeting(stream: &mut TcpStream) -> TestResult<String> {
+    let mut greeting = Vec::new();
+    timeout(TEST_TIMEOUT, async {
+        while !greeting.ends_with(b"\n") {
+            let byte = stream.read_u8().await?;
+            greeting.push(byte);
+            if greeting.len() > 256 {
+                return Err("connection greeting exceeded its bound".into());
+            }
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+    .await??;
+    Ok(String::from_utf8(greeting)?)
+}
+
 async fn expect_success(channel: &mut Channel<client::Msg>) -> TestResult {
     loop {
         let message = timeout(TEST_TIMEOUT, channel.wait())
@@ -559,6 +640,12 @@ async fn read_until_screen_matches(
     matches: impl Fn(&str) -> bool,
 ) -> TestResult {
     let waited = timeout(TEST_TIMEOUT, async {
+        // The condition may already hold from earlier output; without this
+        // check the loop would wait for a frame the server has no reason to
+        // send, timing out on an already-correct screen.
+        if matches(&terminal.screen().contents()) {
+            return Ok::<_, Box<dyn std::error::Error>>(());
+        }
         loop {
             let message = channel
                 .wait()
@@ -628,7 +715,26 @@ async fn open_terminal(
     vt100::Parser,
     Vec<u8>,
 )> {
-    let connection = server.connect().await?;
+    let (connection, channel, terminal, output, _) = open_terminal_observed(server).await?;
+    Ok((connection, channel, terminal, output))
+}
+
+async fn open_terminal_from(
+    server: &TestServer,
+    source: Ipv4Addr,
+) -> TestResult<(
+    client::Handle<TrustExpectedHostKey>,
+    Channel<client::Msg>,
+    vt100::Parser,
+    Vec<u8>,
+)> {
+    let (mut connection, _) = server.connect_unauthenticated_from(Some(source)).await?;
+    assert!(
+        connection
+            .authenticate_none("ignored-visitor-name")
+            .await?
+            .success()
+    );
     let mut channel = connection.channel_open_session().await?;
     channel
         .request_pty(true, "xterm-256color", 80, 24, 0, 0, &[])
@@ -641,6 +747,38 @@ async fn open_terminal(
         channel,
         vt100::Parser::new(24, 80, 0),
         Vec::new(),
+    ))
+}
+
+async fn open_terminal_observed(
+    server: &TestServer,
+) -> TestResult<(
+    client::Handle<TrustExpectedHostKey>,
+    Channel<client::Msg>,
+    vt100::Parser,
+    Vec<u8>,
+    oneshot::Receiver<String>,
+)> {
+    let (mut connection, disconnected) = server.connect_unauthenticated().await?;
+    assert!(
+        connection
+            .authenticate_none("ignored-visitor-name")
+            .await?
+            .success()
+    );
+    let mut channel = connection.channel_open_session().await?;
+    channel
+        .request_pty(true, "xterm-256color", 80, 24, 0, 0, &[])
+        .await?;
+    expect_success(&mut channel).await?;
+    channel.request_shell(true).await?;
+    expect_success(&mut channel).await?;
+    Ok((
+        connection,
+        channel,
+        vt100::Parser::new(24, 80, 0),
+        Vec::new(),
+        disconnected,
     ))
 }
 
@@ -663,6 +801,883 @@ async fn read_through_close(
         exit_status.ok_or_else(|| "server closed without an exit status".into())
     })
     .await?
+}
+
+#[tokio::test]
+async fn invalid_operator_limits_return_typed_startup_errors_instead_of_panicking() -> TestResult {
+    let (_key_dir, host_key_path, _) = make_host_key()?;
+    let invalid_admission = [
+        AdmissionLimits {
+            maximum_handshakes: Semaphore::MAX_PERMITS + 1,
+            ..AdmissionLimits::default()
+        },
+        AdmissionLimits {
+            maximum_browsing_sessions: Semaphore::MAX_PERMITS + 1,
+            ..AdmissionLimits::default()
+        },
+        AdmissionLimits {
+            maximum_connections_per_source: Semaphore::MAX_PERMITS + 1,
+            ..AdmissionLimits::default()
+        },
+        AdmissionLimits {
+            maximum_source_buckets: 65_537,
+            ..AdmissionLimits::default()
+        },
+        AdmissionLimits {
+            source_attempts_per_window: 1,
+            source_attempt_burst: 2,
+            ..AdmissionLimits::default()
+        },
+        AdmissionLimits {
+            source_attempt_window: Duration::from_secs(60 * 60 + 1),
+            ..AdmissionLimits::default()
+        },
+    ];
+    for admission_limits in invalid_admission {
+        let result = Server::bind_with_content(
+            ServerConfig {
+                listen_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                host_key_path: host_key_path.clone(),
+                admission_limits,
+                session_timeouts: SessionTimeouts::default(),
+            },
+            Arc::new(FixtureContent::default()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::Admission(_))));
+    }
+
+    for session_timeouts in [
+        SessionTimeouts {
+            input_idle: Duration::from_secs(8 * 24 * 60 * 60),
+            ..SessionTimeouts::default()
+        },
+        SessionTimeouts {
+            maximum_lifetime: Duration::from_secs(u64::MAX),
+            ..SessionTimeouts::default()
+        },
+        SessionTimeouts {
+            warning_lead: Duration::from_secs(15 * 60),
+            ..SessionTimeouts::default()
+        },
+    ] {
+        let result = Server::bind_with_content(
+            ServerConfig {
+                listen_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                host_key_path: host_key_path.clone(),
+                admission_limits: AdmissionLimits::default(),
+                session_timeouts,
+            },
+            Arc::new(FixtureContent::default()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::InvalidSessionTimeout(_))));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn global_handshake_limit_rejects_exact_excess_and_recovers_after_transport_loss()
+-> TestResult {
+    let limits = AdmissionLimits {
+        maximum_handshakes: 32,
+        maximum_browsing_sessions: 200,
+        maximum_connections_per_source: 40,
+        maximum_source_buckets: 100,
+        source_attempts_per_window: 1_000,
+        source_attempt_burst: 100,
+        source_attempt_window: Duration::from_secs(60),
+    };
+    let server = TestServer::start_with_policy(
+        Arc::new(FixtureContent::default()),
+        limits,
+        SessionTimeouts::default(),
+    )
+    .await?;
+    let source = Ipv4Addr::LOCALHOST;
+    let mut admitted = Vec::new();
+    for _ in 0..32 {
+        let mut stream = raw_connection_from(&server, source).await?;
+        assert!(
+            read_connection_greeting(&mut stream)
+                .await?
+                .starts_with("SSH-2.0-")
+        );
+        admitted.push(stream);
+    }
+
+    let rejected_at = Instant::now();
+    let barrier = Arc::new(Barrier::new(21));
+    let mut arrivals = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let barrier = Arc::clone(&barrier);
+        let address = server.address;
+        arrivals.spawn(async move {
+            let socket = tokio::net::TcpSocket::new_v4()?;
+            socket.bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+            barrier.wait().await;
+            socket.connect(address).await
+        });
+    }
+    barrier.wait().await;
+    let mut excess = Vec::new();
+    while let Some(arrival) = arrivals.join_next().await {
+        excess.push(arrival??);
+    }
+    for stream in &mut excess {
+        assert_eq!(
+            read_connection_greeting(stream).await?,
+            "HNSSH is busy. Please try again shortly.\r\n"
+        );
+    }
+    assert!(rejected_at.elapsed() < TEST_TIMEOUT);
+
+    drop(excess);
+    drop(admitted.pop());
+    let recovered = timeout(TEST_TIMEOUT, async {
+        loop {
+            let mut stream = raw_connection_from(&server, source).await?;
+            let greeting = read_connection_greeting(&mut stream).await?;
+            if greeting.starts_with("SSH-2.0-") {
+                return Ok::<_, Box<dyn std::error::Error>>(stream);
+            }
+            assert!(greeting.contains("busy"));
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    drop(recovered);
+    drop(admitted);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn globally_rejected_arrivals_still_consume_their_source_attempt_budget() -> TestResult {
+    // The capacity barrier needs a second loopback source. Linux configures
+    // the full 127.0.0.0/8; platforms such as macOS only configure
+    // 127.0.0.1, so probe explicitly and skip where the environment cannot
+    // express the scenario instead of assuming dual-stack behavior.
+    let barrier_source = Ipv4Addr::new(127, 0, 0, 2);
+    let probe = tokio::net::TcpSocket::new_v4()?;
+    if probe
+        .bind(SocketAddr::new(IpAddr::V4(barrier_source), 0))
+        .is_err()
+    {
+        eprintln!(
+            "the 127.0.0.2 loopback alias is unavailable; skipped the second-source accounting test"
+        );
+        return Ok(());
+    }
+    drop(probe);
+
+    const SOURCE_ATTEMPTS: usize = 30;
+    let limits = AdmissionLimits {
+        maximum_handshakes: 1,
+        maximum_browsing_sessions: 4,
+        maximum_connections_per_source: SOURCE_ATTEMPTS + 5,
+        maximum_source_buckets: 20,
+        source_attempts_per_window: SOURCE_ATTEMPTS as u32,
+        source_attempt_burst: SOURCE_ATTEMPTS as u32,
+        source_attempt_window: Duration::from_secs(60),
+    };
+    let server = TestServer::start_with_policy(
+        Arc::new(FixtureContent::default()),
+        limits,
+        SessionTimeouts::default(),
+    )
+    .await?;
+    let target_source = Ipv4Addr::LOCALHOST;
+
+    // The first target attempt holds the only global handshake slot without
+    // ever starting a shell. Every remaining attempt is globally rejected
+    // while source-first accounting must still spend the entire budget.
+    let mut held = raw_connection_from(&server, target_source).await?;
+    assert!(
+        read_connection_greeting(&mut held)
+            .await?
+            .starts_with("SSH-2.0-")
+    );
+    for _ in 1..SOURCE_ATTEMPTS {
+        let mut rejected = raw_connection_from(&server, target_source).await?;
+        assert!(
+            read_connection_greeting(&mut rejected)
+                .await?
+                .contains("busy")
+        );
+    }
+
+    // Teardown barrier: half-close and observe the server's FIN. The
+    // connection task has returned and released its handshake permit, so a
+    // busy response below cannot be global overload.
+    held.shutdown().await?;
+    let mut eof = [0_u8; 64];
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            match held.read(&mut eof).await {
+                Ok(0) | Err(_) => return Ok::<_, std::io::Error>(()),
+                Ok(_) => {}
+            }
+        }
+    })
+    .await??;
+
+    // Observable capacity barrier: an independent source can only establish a
+    // full browsing session if global handshake capacity is free.
+    let (barrier_connection, mut barrier, mut terminal, mut output) =
+        timeout(TEST_TIMEOUT, async {
+            loop {
+                if let Ok(visitor) = open_terminal_from(&server, barrier_source).await {
+                    return visitor;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+    read_until_visible(
+        &mut barrier,
+        &mut terminal,
+        &mut output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+
+    let mut source_rejected = raw_connection_from(&server, target_source).await?;
+    assert!(
+        read_connection_greeting(&mut source_rejected)
+            .await?
+            .contains("busy"),
+        "globally rejected arrivals did not consume the target source's attempt budget"
+    );
+    barrier.data_bytes(b"q".as_slice()).await?;
+    assert_eq!(read_through_close(&mut barrier, &mut output).await?, 0);
+    drop(barrier_connection);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn per_source_concurrency_and_attempt_burst_are_exact_and_recover() -> TestResult {
+    let limits = AdmissionLimits {
+        maximum_handshakes: 10,
+        maximum_browsing_sessions: 10,
+        maximum_connections_per_source: 8,
+        maximum_source_buckets: 20,
+        source_attempts_per_window: 100,
+        source_attempt_burst: 20,
+        source_attempt_window: Duration::from_millis(300),
+    };
+    let server = TestServer::start_with_policy(
+        Arc::new(FixtureContent::default()),
+        limits,
+        SessionTimeouts::default(),
+    )
+    .await?;
+    let first_source = Ipv4Addr::new(127, 0, 0, 1);
+    let mut admitted = Vec::new();
+    for _ in 0..8 {
+        let mut stream = raw_connection_from(&server, first_source).await?;
+        assert!(
+            read_connection_greeting(&mut stream)
+                .await?
+                .starts_with("SSH-2.0-")
+        );
+        admitted.push(stream);
+    }
+    let mut excess = raw_connection_from(&server, first_source).await?;
+    assert!(
+        read_connection_greeting(&mut excess)
+            .await?
+            .contains("busy")
+    );
+
+    drop(admitted.pop());
+    sleep(Duration::from_millis(30)).await;
+    let mut recovered = raw_connection_from(&server, first_source).await?;
+    assert!(
+        read_connection_greeting(&mut recovered)
+            .await?
+            .starts_with("SSH-2.0-")
+    );
+
+    drop(admitted);
+    drop(recovered);
+    server.stop().await?;
+
+    let rate_limits = AdmissionLimits {
+        maximum_handshakes: 10,
+        maximum_browsing_sessions: 10,
+        maximum_connections_per_source: 10,
+        maximum_source_buckets: 20,
+        source_attempts_per_window: 2,
+        source_attempt_burst: 2,
+        source_attempt_window: Duration::from_millis(200),
+    };
+    let server = TestServer::start_with_policy(
+        Arc::new(FixtureContent::default()),
+        rate_limits,
+        SessionTimeouts::default(),
+    )
+    .await?;
+    let mut first = raw_connection_from(&server, first_source).await?;
+    let mut second = raw_connection_from(&server, first_source).await?;
+    assert!(
+        read_connection_greeting(&mut first)
+            .await?
+            .starts_with("SSH-2.0-")
+    );
+    assert!(
+        read_connection_greeting(&mut second)
+            .await?
+            .starts_with("SSH-2.0-")
+    );
+    let mut burst_excess = raw_connection_from(&server, first_source).await?;
+    assert!(
+        read_connection_greeting(&mut burst_excess)
+            .await?
+            .contains("busy")
+    );
+    sleep(Duration::from_millis(120)).await;
+    let mut refilled = raw_connection_from(&server, first_source).await?;
+    assert!(
+        read_connection_greeting(&mut refilled)
+            .await?
+            .starts_with("SSH-2.0-")
+    );
+    drop(first);
+    drop(second);
+    drop(refilled);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn established_session_limit_rejects_excess_without_displacing_browsers_and_recovers()
+-> TestResult {
+    let limits = AdmissionLimits {
+        maximum_handshakes: 10,
+        maximum_browsing_sessions: 2,
+        maximum_connections_per_source: 10,
+        maximum_source_buckets: 20,
+        source_attempts_per_window: 1_000,
+        source_attempt_burst: 50,
+        source_attempt_window: Duration::from_secs(60),
+    };
+    let server = TestServer::start_with_policy(
+        Arc::new(FixtureContent::default()),
+        limits,
+        SessionTimeouts::default(),
+    )
+    .await?;
+    let first = open_terminal(&server).await?;
+    let second = open_terminal(&server).await?;
+    let (first_connection, mut first_channel, mut first_terminal, mut first_output) = first;
+    let (second_connection, mut second_channel, mut second_terminal, mut second_output) = second;
+    let (first_ready, second_ready) = tokio::join!(
+        read_until_visible(
+            &mut first_channel,
+            &mut first_terminal,
+            &mut first_output,
+            "Rust reaches the tiny terminal",
+        ),
+        read_until_visible(
+            &mut second_channel,
+            &mut second_terminal,
+            &mut second_output,
+            "Rust reaches the tiny terminal",
+        ),
+    );
+    first_ready?;
+    second_ready?;
+
+    let third_connection = server.connect().await?;
+    let mut third_channel = third_connection.channel_open_session().await?;
+    third_channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await?;
+    expect_success(&mut third_channel).await?;
+    third_channel.request_shell(true).await?;
+    expect_success(&mut third_channel).await?;
+    let mut rejected_output = Vec::new();
+    assert_eq!(
+        read_through_close(&mut third_channel, &mut rejected_output).await?,
+        1
+    );
+    assert!(String::from_utf8_lossy(&rejected_output).contains("HNSSH is busy"));
+
+    first_channel.data_bytes(b"j".as_slice()).await?;
+    read_until_visible(
+        &mut first_channel,
+        &mut first_terminal,
+        &mut first_output,
+        "> 2. Ask HN:",
+    )
+    .await?;
+    second_channel.data_bytes(b"?".as_slice()).await?;
+    read_until_visible(
+        &mut second_channel,
+        &mut second_terminal,
+        &mut second_output,
+        "Keyboard help",
+    )
+    .await?;
+
+    first_channel.data_bytes(b"q".as_slice()).await?;
+    assert_eq!(
+        read_through_close(&mut first_channel, &mut first_output).await?,
+        0
+    );
+    let (fourth_connection, mut fourth_channel, mut fourth_terminal, mut fourth_output) =
+        open_terminal(&server).await?;
+    read_until_visible(
+        &mut fourth_channel,
+        &mut fourth_terminal,
+        &mut fourth_output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+
+    second_channel.data_bytes(b"q".as_slice()).await?;
+    fourth_channel.data_bytes(b"q".as_slice()).await?;
+    assert_eq!(
+        read_through_close(&mut second_channel, &mut second_output).await?,
+        0
+    );
+    assert_eq!(
+        read_through_close(&mut fourth_channel, &mut fourth_output).await?,
+        0
+    );
+    drop(first_connection);
+    drop(second_connection);
+    drop(third_connection);
+    drop(fourth_connection);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn cap_one_recovers_after_setup_end_actor_cancellation_and_abrupt_transport_loss()
+-> TestResult {
+    let limits = AdmissionLimits {
+        maximum_handshakes: 1,
+        maximum_browsing_sessions: 1,
+        maximum_connections_per_source: 10,
+        maximum_source_buckets: 20,
+        source_attempts_per_window: 100,
+        source_attempt_burst: 100,
+        source_attempt_window: Duration::from_secs(60),
+    };
+    let server = TestServer::start_with_policy(
+        Arc::new(FixtureContent::default()),
+        limits,
+        SessionTimeouts::default(),
+    )
+    .await?;
+
+    for ending in ["eof", "close"] {
+        let (mut connection, disconnected) = server.connect_unauthenticated().await?;
+        assert!(
+            connection
+                .authenticate_none("setup-ending")
+                .await?
+                .success()
+        );
+        let channel = connection.channel_open_session().await?;
+        if ending == "eof" {
+            channel.eof().await?;
+        } else {
+            channel.close().await?;
+        }
+        timeout(TEST_TIMEOUT, disconnected).await??;
+        drop((connection, channel));
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    let (mut no_pty, no_pty_disconnected) = server.connect_unauthenticated().await?;
+    assert!(no_pty.authenticate_none("no-pty").await?.success());
+    let mut no_pty_channel = no_pty.channel_open_session().await?;
+    no_pty_channel.request_shell(true).await?;
+    expect_success(&mut no_pty_channel).await?;
+    let mut no_pty_output = Vec::new();
+    assert_eq!(
+        read_through_close(&mut no_pty_channel, &mut no_pty_output).await?,
+        1
+    );
+    assert!(String::from_utf8_lossy(&no_pty_output).contains("interactive terminal"));
+    timeout(TEST_TIMEOUT, no_pty_disconnected).await??;
+    drop(no_pty);
+    sleep(Duration::from_millis(20)).await;
+
+    let (mut cancelled, cancelled_disconnected) = server.connect_unauthenticated().await?;
+    assert!(
+        cancelled
+            .authenticate_none("cancelled-actor")
+            .await?
+            .success()
+    );
+    let mut cancelled_channel = cancelled.channel_open_session().await?;
+    cancelled_channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await?;
+    expect_success(&mut cancelled_channel).await?;
+    cancelled_channel.request_shell(true).await?;
+    expect_success(&mut cancelled_channel).await?;
+    let mut cancelled_terminal = vt100::Parser::new(24, 80, 0);
+    let mut cancelled_output = Vec::new();
+    read_until_visible(
+        &mut cancelled_channel,
+        &mut cancelled_terminal,
+        &mut cancelled_output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+    cancelled_channel.close().await?;
+    timeout(TEST_TIMEOUT, cancelled_disconnected).await??;
+    drop(cancelled);
+    sleep(Duration::from_millis(20)).await;
+
+    let (mut lost, lost_disconnected, socket) =
+        server.connect_unauthenticated_with_socket().await?;
+    assert!(lost.authenticate_none("transport-loss").await?.success());
+    let mut lost_channel = lost.channel_open_session().await?;
+    lost_channel
+        .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+        .await?;
+    expect_success(&mut lost_channel).await?;
+    lost_channel.request_shell(true).await?;
+    expect_success(&mut lost_channel).await?;
+    let mut lost_terminal = vt100::Parser::new(24, 80, 0);
+    let mut lost_output = Vec::new();
+    read_until_visible(
+        &mut lost_channel,
+        &mut lost_terminal,
+        &mut lost_output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+    socket.shutdown(std::net::Shutdown::Both)?;
+    timeout(TEST_TIMEOUT, lost_disconnected).await??;
+    drop((lost, lost_channel));
+    sleep(Duration::from_millis(20)).await;
+
+    let (_replacement, mut replacement, mut terminal, mut output) = open_terminal(&server).await?;
+    read_until_visible(
+        &mut replacement,
+        &mut terminal,
+        &mut output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+    replacement.data_bytes(b"q".as_slice()).await?;
+    assert_eq!(read_through_close(&mut replacement, &mut output).await?, 0);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn barrier_race_admits_exact_capacity_and_rejects_twenty_concurrent_shells() -> TestResult {
+    let limits = AdmissionLimits {
+        maximum_handshakes: 32,
+        maximum_browsing_sessions: 4,
+        maximum_connections_per_source: 30,
+        maximum_source_buckets: 40,
+        source_attempts_per_window: 30,
+        source_attempt_burst: 30,
+        source_attempt_window: Duration::from_secs(60),
+    };
+    let server = TestServer::start_with_policy(
+        Arc::new(FixtureContent::default()),
+        limits,
+        SessionTimeouts::default(),
+    )
+    .await?;
+    let mut pending = Vec::new();
+    for _ in 0..24 {
+        let connection = server.connect().await?;
+        let mut channel = connection.channel_open_session().await?;
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await?;
+        expect_success(&mut channel).await?;
+        pending.push((connection, channel));
+    }
+
+    enum RaceResult {
+        Active(
+            client::Handle<TrustExpectedHostKey>,
+            Channel<client::Msg>,
+            Vec<u8>,
+        ),
+        Rejected,
+    }
+
+    let barrier = Arc::new(Barrier::new(25));
+    let mut racers = tokio::task::JoinSet::new();
+    for (connection, mut channel) in pending {
+        let barrier = Arc::clone(&barrier);
+        racers.spawn(async move {
+            barrier.wait().await;
+            channel.request_shell(true).await.expect("request shell");
+            let mut shell_accepted = false;
+            let mut busy = false;
+            let mut initial = Vec::new();
+            loop {
+                match timeout(TEST_TIMEOUT, channel.wait())
+                    .await
+                    .expect("race response timeout")
+                    .expect("race channel closed without response")
+                {
+                    ChannelMsg::Success => shell_accepted = true,
+                    ChannelMsg::Failure => panic!("shell request unexpectedly failed"),
+                    ChannelMsg::Data { data } => {
+                        assert!(shell_accepted, "data arrived before shell acceptance");
+                        initial.extend_from_slice(&data);
+                        if initial.starts_with(b"\x1b") {
+                            return RaceResult::Active(connection, channel, initial);
+                        }
+                        if String::from_utf8_lossy(&initial).contains("HNSSH is busy") {
+                            busy = true;
+                        }
+                    }
+                    ChannelMsg::Close if busy => return RaceResult::Rejected,
+                    ChannelMsg::Close => panic!("admitted shell closed without a screen"),
+                    _ => {}
+                }
+            }
+        });
+    }
+    barrier.wait().await;
+
+    let mut active = Vec::new();
+    let mut rejected = 0;
+    while let Some(result) = racers.join_next().await {
+        match result? {
+            RaceResult::Active(connection, channel, output) => {
+                active.push((connection, channel, output));
+            }
+            RaceResult::Rejected => rejected += 1,
+        }
+    }
+    assert_eq!(active.len(), 4);
+    assert_eq!(rejected, 20);
+
+    let mut terminal = vt100::Parser::new(24, 80, 0);
+    let (_, first_channel, first_output) = &mut active[0];
+    terminal.process(first_output);
+    read_until_visible(
+        first_channel,
+        &mut terminal,
+        first_output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+    first_channel.data_bytes(b"j".as_slice()).await?;
+    read_until_visible(first_channel, &mut terminal, first_output, "> 2. Ask HN:").await?;
+    for (_, channel, _) in &mut active {
+        let _ = channel.data_bytes(b"q".as_slice()).await;
+    }
+    drop(active);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn production_session_cap_holds_two_hundred_real_browsers_and_rejects_the_next() -> TestResult
+{
+    let limits = AdmissionLimits {
+        maximum_handshakes: 32,
+        maximum_browsing_sessions: 200,
+        maximum_connections_per_source: 220,
+        maximum_source_buckets: 300,
+        source_attempts_per_window: 10_000,
+        source_attempt_burst: 220,
+        source_attempt_window: Duration::from_secs(60),
+    };
+    let server = TestServer::start_with_policy(
+        Arc::new(FixtureContent::default()),
+        limits,
+        SessionTimeouts::default(),
+    )
+    .await?;
+    let mut visitors = Vec::with_capacity(200);
+    for _ in 0..200 {
+        let connection = server.connect().await?;
+        let mut channel = connection.channel_open_session().await?;
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await?;
+        expect_success(&mut channel).await?;
+        channel.request_shell(true).await?;
+        expect_success(&mut channel).await?;
+        visitors.push((connection, channel));
+    }
+
+    let excess_connection = server.connect().await?;
+    let mut excess = excess_connection.channel_open_session().await?;
+    excess.request_pty(true, "xterm", 80, 24, 0, 0, &[]).await?;
+    expect_success(&mut excess).await?;
+    excess.request_shell(true).await?;
+    expect_success(&mut excess).await?;
+    let mut excess_output = Vec::new();
+    assert_eq!(
+        read_through_close(&mut excess, &mut excess_output).await?,
+        1
+    );
+    assert!(String::from_utf8_lossy(&excess_output).contains("HNSSH is busy"));
+
+    let mut terminal = vt100::Parser::new(24, 80, 0);
+    let mut output = Vec::new();
+    read_until_visible(
+        &mut visitors[0].1,
+        &mut terminal,
+        &mut output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+    visitors[0].1.data_bytes(b"j".as_slice()).await?;
+    read_until_visible(
+        &mut visitors[0].1,
+        &mut terminal,
+        &mut output,
+        "> 2. Ask HN:",
+    )
+    .await?;
+
+    visitors[0].1.data_bytes(b"q".as_slice()).await?;
+    assert_eq!(
+        read_through_close(&mut visitors[0].1, &mut output).await?,
+        0
+    );
+    let (replacement_connection, mut replacement, mut replacement_terminal, mut replacement_output) =
+        open_terminal(&server).await?;
+    read_until_visible(
+        &mut replacement,
+        &mut replacement_terminal,
+        &mut replacement_output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+
+    for (_, channel) in visitors.iter_mut().skip(1) {
+        let _ = channel.data_bytes(b"q".as_slice()).await;
+    }
+    replacement.data_bytes(b"q".as_slice()).await?;
+    drop(visitors);
+    drop(excess_connection);
+    drop(replacement_connection);
+    server.stop().await
+}
+
+#[tokio::test]
+async fn idle_warning_resets_on_input_then_timeout_releases_the_session_permit() -> TestResult {
+    let limits = AdmissionLimits {
+        maximum_browsing_sessions: 1,
+        maximum_connections_per_source: 10,
+        source_attempts_per_window: 1_000,
+        source_attempt_burst: 50,
+        ..AdmissionLimits::default()
+    };
+    let timeouts = SessionTimeouts {
+        input_idle: Duration::from_secs(6),
+        maximum_lifetime: Duration::from_secs(30),
+        warning_lead: Duration::from_secs(3),
+    };
+    let server =
+        TestServer::start_with_policy(Arc::new(FixtureContent::default()), limits, timeouts)
+            .await?;
+    let (_connection, mut channel, mut terminal, mut output, disconnected) =
+        open_terminal_observed(&server).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "WARNING: input-idle timeout",
+    )
+    .await?;
+    // Reset with a multi-second margin, then cross the old deadline. Exact
+    // deadline ordering is covered deterministically by the policy unit test.
+    sleep(Duration::from_secs(1)).await;
+    channel.data_bytes(b"?".as_slice()).await?;
+    read_until_screen_matches(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "input clears the idle warning",
+        |screen| screen.contains("Keyboard help") && !screen.contains("WARNING:"),
+    )
+    .await?;
+    sleep(Duration::from_secs(3)).await;
+    channel.data_bytes(&[0x7f][..]).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut output, "Top feed").await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "WARNING: input-idle timeout",
+    )
+    .await?;
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 1);
+    assert!(String::from_utf8_lossy(&output).contains("without input"));
+    timeout(TEST_TIMEOUT, disconnected).await??;
+    drop(_connection);
+
+    let (_replacement, mut replacement, mut replacement_terminal, mut replacement_output) =
+        open_terminal(&server).await?;
+    read_until_visible(
+        &mut replacement,
+        &mut replacement_terminal,
+        &mut replacement_output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+    replacement.data_bytes(b"q".as_slice()).await?;
+    assert_eq!(
+        read_through_close(&mut replacement, &mut replacement_output).await?,
+        0
+    );
+    server.stop().await
+}
+
+#[tokio::test]
+async fn maximum_lifetime_warns_and_closes_despite_recent_input() -> TestResult {
+    let timeouts = SessionTimeouts {
+        input_idle: Duration::from_secs(20),
+        maximum_lifetime: Duration::from_secs(4),
+        warning_lead: Duration::from_secs(2),
+    };
+    let server = TestServer::start_with_policy(
+        Arc::new(FixtureContent::default()),
+        AdmissionLimits {
+            maximum_connections_per_source: 10,
+            source_attempts_per_window: 1_000,
+            source_attempt_burst: 50,
+            ..AdmissionLimits::default()
+        },
+        timeouts,
+    )
+    .await?;
+    let (_connection, mut channel, mut terminal, mut output) = open_terminal(&server).await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "Rust reaches the tiny terminal",
+    )
+    .await?;
+    sleep(Duration::from_secs(1)).await;
+    channel.data_bytes(b"j".as_slice()).await?;
+    read_until_visible(&mut channel, &mut terminal, &mut output, "> 2. Ask HN:").await?;
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut output,
+        "WARNING: maximum session lifetime",
+    )
+    .await?;
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 1);
+    assert!(String::from_utf8_lossy(&output).contains("maximum lifetime"));
+    server.stop().await
 }
 
 #[tokio::test]
@@ -1802,9 +2817,13 @@ async fn refresh_is_coalesced_throttled_and_keeps_failed_content_visibly_stale()
     );
 
     let fake = FakeHackerNews::start(routes).await?;
+    // A wide revalidation window makes the throttle assertion below depend on
+    // policy rather than on scheduling latency between test steps.
+    let mut options = fast_hacker_news_options();
+    options.revalidation_interval = Duration::from_secs(1);
     let content = Arc::new(HackerNewsContent::for_endpoint_with_options(
         fake.endpoint(),
-        fast_hacker_news_options(),
+        options,
     ));
     let server = TestServer::start_with_content(content).await?;
     let first = open_terminal(&server).await?;
@@ -1913,14 +2932,14 @@ async fn refresh_is_coalesced_throttled_and_keeps_failed_content_visibly_stale()
     assert_eq!(fake.request_count("topstories"), 3);
 
     first_channel.data_bytes(&b"r"[..]).await?;
-    sleep(Duration::from_millis(30)).await;
+    sleep(Duration::from_millis(100)).await;
     assert_eq!(
         fake.request_count("topstories"),
         3,
         "revalidation is throttled for the same resource"
     );
 
-    sleep(Duration::from_millis(70)).await;
+    sleep(Duration::from_millis(1_500)).await;
     first_channel.data_bytes(&b"r"[..]).await?;
     read_until_visible(
         &mut first_channel,
@@ -2333,19 +3352,22 @@ async fn visitor_sees_depth_and_node_limit_markers_without_fetching_past_them() 
     .await?;
     let visit_wide_siblings = vec![b'n'; 999];
     channel.data_bytes(visit_wide_siblings).await?;
+    // Wait for the selected comment result before explicit paging so its
+    // identity-reveal redraw cannot legitimately bring the header back over
+    // the marker after Page Down.
+    read_until_visible(
+        &mut channel,
+        &mut terminal,
+        &mut raw_output,
+        "wide-author-20999",
+    )
+    .await?;
     channel.data_bytes(&b"\x1b[6~"[..]).await?;
     read_until_visible(
         &mut channel,
         &mut terminal,
         &mut raw_output,
         "[thread node limit of 1000 reached]",
-    )
-    .await?;
-    read_until_visible(
-        &mut channel,
-        &mut terminal,
-        &mut raw_output,
-        "wide-author-20999",
     )
     .await?;
     assert_eq!(content.request_count(20_999), 1);
@@ -2906,6 +3928,26 @@ async fn expect_failure(channel: &mut Channel<client::Msg>) -> TestResult {
     .await?
 }
 
+/// A request sent after the server intentionally tears down on channel EOF may
+/// observe a `Failure` frame or lose the channel/connection before any reply is
+/// delivered. Either proves the request was not accepted, so only `Success` is
+/// a failure; teardown no longer has to wait for a rejection round trip.
+async fn expect_failure_or_teardown(channel: &mut Channel<client::Msg>) -> TestResult {
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Failure) => return Ok(()),
+                Some(ChannelMsg::Success) => {
+                    return Err("request after EOF was unexpectedly accepted".into());
+                }
+                Some(ChannelMsg::Data { .. }) | Some(ChannelMsg::WindowAdjusted { .. }) => {}
+                Some(_) | None => return Ok(()),
+            }
+        }
+    })
+    .await?
+}
+
 fn assert_channel_denied(result: Result<Channel<client::Msg>, russh::Error>) {
     assert!(
         matches!(
@@ -3027,8 +4069,13 @@ async fn duplicate_and_unsupported_requests_preserve_the_browsing_session() -> T
     read_until_visible(&mut channel, &mut terminal, &mut output, "> 2. Ask HN:").await?;
     channel.data_bytes(&b"q"[..]).await?;
     assert_eq!(read_through_close(&mut channel, &mut output).await?, 0);
-    // The one-channel limit is per connection, not merely concurrently open channels.
-    assert_channel_denied(timeout(TEST_TIMEOUT, connection.channel_open_session()).await?);
+    timeout(TEST_TIMEOUT, async {
+        while !connection.is_closed() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    assert!(connection.channel_open_session().await.is_err());
     server.stop().await
 }
 
@@ -3266,13 +4313,26 @@ async fn eof_during_setup_prevents_later_pty_or_shell_acceptance() -> TestResult
             expect_success(&mut channel).await?;
         }
         channel.eof().await?;
-        channel
+        // The EOF teardown may close the transport before these requests can
+        // even be written or answered. Neither is acceptance; a send error or
+        // channel/connection closure is an acceptable rejection outcome.
+        if channel
             .request_pty(true, "xterm", 80, 24, 0, 0, &[])
-            .await?;
-        expect_failure(&mut channel).await?;
-        channel.request_shell(true).await?;
-        expect_failure(&mut channel).await?;
-        assert_channel_denied(timeout(TEST_TIMEOUT, connection.channel_open_session()).await?);
+            .await
+            .is_ok()
+        {
+            expect_failure_or_teardown(&mut channel).await?;
+        }
+        if channel.request_shell(true).await.is_ok() {
+            expect_failure_or_teardown(&mut channel).await?;
+        }
+        timeout(TEST_TIMEOUT, async {
+            while !connection.is_closed() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert!(connection.channel_open_session().await.is_err());
     }
     server.stop().await
 }
@@ -3468,11 +4528,12 @@ async fn shell_without_a_pty_gets_reconnection_help() -> TestResult {
     assert!(output.contains("HNSSH requires an interactive terminal"));
     assert!(output.contains("ssh -t <hostname>"));
     assert!(!output.contains("\x1b[?1049h"));
-    assert_channel_denied(timeout(TEST_TIMEOUT, connection.channel_open_session()).await?);
-
-    connection
-        .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
-        .await
-        .ok();
+    timeout(TEST_TIMEOUT, async {
+        while !connection.is_closed() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    assert!(connection.channel_open_session().await.is_err());
     server.stop().await
 }

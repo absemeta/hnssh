@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::browser::{Browser, FeedRowState, FeedStatus, ViewKind};
 use crate::content::{
@@ -45,28 +45,54 @@ pub(crate) fn navigation_page_len(view: ViewKind, rows: u16) -> usize {
     }
 }
 
-pub(crate) fn render(frame: &mut Frame<'_>, browser: &mut Browser, size: Rect) -> RenderOutput {
-    if (size.width < MIN_COLUMNS || size.height < MIN_ROWS) && browser.view_kind() != ViewKind::Help
+pub(crate) fn render(
+    frame: &mut Frame<'_>,
+    browser: &mut Browser,
+    size: Rect,
+    warning: Option<&str>,
+) -> RenderOutput {
+    let output = if (size.width < MIN_COLUMNS || size.height < MIN_ROWS)
+        && browser.view_kind() != ViewKind::Help
     {
         render_resize(frame, size);
-        return RenderOutput::default();
+        RenderOutput::default()
+    } else {
+        match browser.view_kind() {
+            ViewKind::Feed => {
+                render_feed(frame, browser, size);
+                RenderOutput::default()
+            }
+            ViewKind::Entry => render_entry(frame, browser, size),
+            ViewKind::Destination => RenderOutput {
+                hyperlinks: render_destination(frame, browser, size),
+                ..RenderOutput::default()
+            },
+            ViewKind::Help => {
+                render_help(frame, browser, size);
+                RenderOutput::default()
+            }
+        }
+    };
+    if let Some(warning) = warning {
+        render_timeout_warning(frame, size, warning);
     }
+    output
+}
 
-    match browser.view_kind() {
-        ViewKind::Feed => {
-            render_feed(frame, browser, size);
-            RenderOutput::default()
-        }
-        ViewKind::Entry => render_entry(frame, browser, size),
-        ViewKind::Destination => RenderOutput {
-            hyperlinks: render_destination(frame, browser, size),
-            ..RenderOutput::default()
-        },
-        ViewKind::Help => {
-            render_help(frame, browser, size);
-            RenderOutput::default()
-        }
+fn render_timeout_warning(frame: &mut Frame<'_>, size: Rect, warning: &str) {
+    if size.is_empty() {
+        return;
     }
+    let area = Rect::new(size.x, size.y, size.width, 1);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(warning).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        area,
+    );
 }
 
 fn render_resize(frame: &mut Frame<'_>, size: Rect) {

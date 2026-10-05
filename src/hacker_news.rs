@@ -16,6 +16,7 @@ use crate::content::{
     PollOptionStatus, RichText,
 };
 use crate::content_safety::{normalize_html, normalize_inline_text, validated_url};
+use crate::panic_reporting::report_join_error;
 
 const PRODUCTION_ENDPOINT: &str = "https://hacker-news.firebaseio.com/v0";
 const POLL_OPTION_CONCURRENCY: usize = 8;
@@ -242,8 +243,9 @@ impl HackerNewsContent {
                     });
                 }
                 while let Some(result) = loads.join_next().await {
-                    if let Ok((position, option)) = result {
-                        loaded_options[position] = Some(option);
+                    match result {
+                        Ok((position, option)) => loaded_options[position] = Some(option),
+                        Err(error) => report_join_error(error, "poll_option"),
                     }
                     if let Some((position, option_id)) = pending.next() {
                         let source = self.clone();
