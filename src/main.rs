@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod systemd_activation;
+
 use clap::Parser;
 use hnssh::{AdmissionLimits, Server, ServerConfig, SessionTimeouts, privacy_safe_process_entry};
 use tokio_util::sync::CancellationToken;
@@ -11,13 +13,21 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(about = "Browse Hacker News over anonymous SSH")]
 struct Arguments {
-    /// Address used by the development SSH listener.
+    /// SSH address used when no systemd listener is inherited.
     #[arg(long, env = "HNSSH_LISTEN_ADDRESS", default_value = "127.0.0.1:2222")]
     listen_address: SocketAddr,
 
     /// Existing SSH private host key. HNSSH never generates or replaces it.
     #[arg(long, env = "HNSSH_HOST_KEY", value_name = "PATH")]
     host_key: PathBuf,
+
+    /// Loopback-only address for liveness, readiness, and aggregate metrics.
+    #[arg(
+        long,
+        env = "HNSSH_OPERATIONS_ADDRESS",
+        default_value = "127.0.0.1:9090"
+    )]
+    operations_address: SocketAddr,
 
     /// Maximum SSH handshakes and PTY/shell setups in progress.
     #[arg(long, env = "HNSSH_MAX_HANDSHAKES", default_value_t = 32)]
@@ -73,15 +83,20 @@ fn production_main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "hnssh=info".into()))
         .init();
     let arguments = Arguments::parse();
+    let inherited_listener = systemd_activation::take_listener()?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(arguments))
+        .block_on(run(arguments, inherited_listener))
 }
 
-async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
-    let server = Server::bind(ServerConfig {
+async fn run(
+    arguments: Arguments,
+    inherited_listener: Option<std::net::TcpListener>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig {
         listen_address: arguments.listen_address,
+        operations_address: arguments.operations_address,
         host_key_path: arguments.host_key,
         admission_limits: AdmissionLimits {
             maximum_handshakes: arguments.max_handshakes,
@@ -97,9 +112,17 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             maximum_lifetime: Duration::from_secs(arguments.max_session_seconds),
             warning_lead: Duration::from_secs(arguments.timeout_warning_seconds),
         },
-    })
-    .await?;
-    info!(listener.address = %server.local_addr()?, "HNSSH SSH listener ready");
+    };
+    let socket_activated = inherited_listener.is_some();
+    let server = match inherited_listener {
+        Some(listener) => Server::from_listener(config, listener).await?,
+        None => Server::bind(config).await?,
+    };
+    if socket_activated {
+        info!("HNSSH using systemd-inherited SSH listener");
+    }
+    info!(listener.address = %server.local_addr()?, "HNSSH SSH listener initialized");
+    info!(operations.address = %server.operations_addr(), "HNSSH operations listener initialized");
 
     let shutdown = CancellationToken::new();
     let signal = shutdown.clone();

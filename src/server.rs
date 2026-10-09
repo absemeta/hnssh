@@ -18,7 +18,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::admission::{
     Admission, AdmissionError, AdmissionLimits, ConnectionAdmission, SessionAdmission,
@@ -29,8 +29,10 @@ use crate::content::{
 };
 use crate::hacker_news::HackerNewsContent;
 use crate::input::{InputDecoder, Key};
+use crate::operations::Operations;
 use crate::panic_reporting::report_join_error;
 use crate::ssh_transport::SshTransport;
+use crate::telemetry::{SessionClosureKind, SetupTimeoutKind, Telemetry};
 use crate::terminal_output::TerminalOutput;
 use crate::thread::{CommentLoad, CommentUpdate};
 use crate::ui;
@@ -86,6 +88,7 @@ impl Default for SessionTimeouts {
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub listen_address: SocketAddr,
+    pub operations_address: SocketAddr,
     pub host_key_path: PathBuf,
     pub admission_limits: AdmissionLimits,
     pub session_timeouts: SessionTimeouts,
@@ -105,6 +108,16 @@ pub enum ServerError {
         #[source]
         source: io::Error,
     },
+    #[error("could not configure inherited SSH listener")]
+    ConfigureInheritedListener(#[source] io::Error),
+    #[error("operations listener address must be loopback, got {0}")]
+    PublicOperationsAddress(SocketAddr),
+    #[error("could not bind operations listener at {address}")]
+    BindOperations {
+        address: SocketAddr,
+        #[source]
+        source: io::Error,
+    },
     #[error("could not accept an SSH connection")]
     Accept(#[source] io::Error),
     #[error(transparent)]
@@ -115,21 +128,67 @@ pub enum ServerError {
 
 pub struct Server {
     listener: TcpListener,
+    operations: Operations,
     ssh_config: Arc<server::Config>,
     content: Arc<dyn ContentSource>,
     admission: Admission,
     session_timeouts: SessionTimeouts,
+    telemetry: Telemetry,
 }
 
 impl Server {
     pub async fn bind(config: ServerConfig) -> Result<Self, ServerError> {
-        Self::bind_with_content(config, Arc::new(HackerNewsContent::production())).await
+        let telemetry = Telemetry::new(&config.admission_limits);
+        let content = Arc::new(HackerNewsContent::production_with_telemetry(
+            telemetry.clone(),
+        ));
+        Self::bind_with_parts(config, content, telemetry, None).await
+    }
+
+    /// Starts HNSSH with a pre-bound TCP listener, such as one inherited from
+    /// systemd socket activation. The listener is switched to nonblocking mode
+    /// and otherwise follows the same admission and session path as a directly
+    /// bound listener.
+    pub async fn from_listener(
+        config: ServerConfig,
+        listener: std::net::TcpListener,
+    ) -> Result<Self, ServerError> {
+        let telemetry = Telemetry::new(&config.admission_limits);
+        let content = Arc::new(HackerNewsContent::production_with_telemetry(
+            telemetry.clone(),
+        ));
+        Self::bind_with_parts(config, content, telemetry, Some(listener)).await
     }
 
     pub async fn bind_with_content(
         config: ServerConfig,
         content: Arc<dyn ContentSource>,
     ) -> Result<Self, ServerError> {
+        let telemetry = Telemetry::new(&config.admission_limits);
+        Self::bind_with_parts(config, content, telemetry, None).await
+    }
+
+    /// Test/content-source counterpart to [`Server::from_listener`].
+    pub async fn from_listener_with_content(
+        config: ServerConfig,
+        listener: std::net::TcpListener,
+        content: Arc<dyn ContentSource>,
+    ) -> Result<Self, ServerError> {
+        let telemetry = Telemetry::new(&config.admission_limits);
+        Self::bind_with_parts(config, content, telemetry, Some(listener)).await
+    }
+
+    async fn bind_with_parts(
+        config: ServerConfig,
+        content: Arc<dyn ContentSource>,
+        telemetry: Telemetry,
+        inherited_listener: Option<std::net::TcpListener>,
+    ) -> Result<Self, ServerError> {
+        if !config.operations_address.ip().is_loopback() {
+            return Err(ServerError::PublicOperationsAddress(
+                config.operations_address,
+            ));
+        }
         let host_key = load_secret_key(&config.host_key_path, None).map_err(|source| {
             ServerError::LoadHostKey {
                 path: config.host_key_path.clone(),
@@ -137,20 +196,36 @@ impl Server {
             }
         })?;
         validate_session_timeouts(&config.session_timeouts)?;
-        let admission = Admission::new(config.admission_limits)?;
-        let listener = TcpListener::bind(config.listen_address)
+        let admission = Admission::new_with_telemetry(config.admission_limits, telemetry.clone())?;
+        let listener = match inherited_listener {
+            Some(listener) => {
+                listener
+                    .set_nonblocking(true)
+                    .map_err(ServerError::ConfigureInheritedListener)?;
+                TcpListener::from_std(listener).map_err(ServerError::ConfigureInheritedListener)?
+            }
+            None => TcpListener::bind(config.listen_address)
+                .await
+                .map_err(|source| ServerError::Bind {
+                    address: config.listen_address,
+                    source,
+                })?,
+        };
+        let operations = Operations::bind(config.operations_address, telemetry.clone())
             .await
-            .map_err(|source| ServerError::Bind {
-                address: config.listen_address,
+            .map_err(|source| ServerError::BindOperations {
+                address: config.operations_address,
                 source,
             })?;
 
         Ok(Self {
             listener,
+            operations,
             ssh_config: ssh_config(host_key),
             content,
             admission,
             session_timeouts: config.session_timeouts,
+            telemetry,
         })
     }
 
@@ -158,11 +233,17 @@ impl Server {
         self.listener.local_addr()
     }
 
-    pub async fn run(self, shutdown: CancellationToken) -> Result<(), ServerError> {
+    pub fn operations_addr(&self) -> SocketAddr {
+        self.operations.local_addr()
+    }
+
+    pub async fn run(mut self, shutdown: CancellationToken) -> Result<(), ServerError> {
         let mut sessions = JoinSet::new();
         let mut rejections = JoinSet::new();
         let mut admission_cleanup = interval(self.admission.cleanup_interval());
         admission_cleanup.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        self.operations.set_ready(true);
+        info!("HNSSH runtime ready");
 
         loop {
             tokio::select! {
@@ -191,6 +272,7 @@ impl Server {
                     let content = Arc::clone(&self.content);
                     let session_shutdown = shutdown.child_token();
                     let session_timeouts = self.session_timeouts.clone();
+                    let telemetry = self.telemetry.clone();
                     sessions.spawn(async move {
                         run_connection(
                             ssh_config,
@@ -199,6 +281,7 @@ impl Server {
                             session_shutdown,
                             connection_admission,
                             session_timeouts,
+                            telemetry,
                         )
                         .await
                     });
@@ -206,6 +289,8 @@ impl Server {
             }
         }
 
+        self.operations.set_ready(false);
+        info!("HNSSH runtime draining");
         rejections.abort_all();
         while let Some(joined) = rejections.join_next().await {
             if let Err(error) = joined {
@@ -227,6 +312,8 @@ impl Server {
             }
         }
 
+        self.operations.shutdown().await;
+        info!("HNSSH runtime stopped");
         Ok(())
     }
 }
@@ -297,6 +384,7 @@ async fn run_connection(
     shutdown: CancellationToken,
     admission: ConnectionAdmission,
     session_timeouts: SessionTimeouts,
+    telemetry: Telemetry,
 ) -> Result<(), SessionError> {
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     // run_stream only exchanges identification before spawning russh's task; dropping
@@ -320,6 +408,7 @@ async fn run_connection(
                 &scope,
                 session_admission,
                 session_timeouts,
+                telemetry.clone(),
             ),
         )) => match result {
             Ok(result) => result?,
@@ -352,7 +441,18 @@ async fn run_connection(
                     Some(deadline) => sleep_until(deadline).await,
                     None => std::future::pending().await,
                 }
-            } => break reason,
+            } => {
+                match *changes.borrow() {
+                    SetupProgress::Authenticating => {
+                        telemetry.setup_timed_out(SetupTimeoutKind::Handshake);
+                    }
+                    SetupProgress::Authenticated(_) => {
+                        telemetry.setup_timed_out(SetupTimeoutKind::PtyAndShell);
+                    }
+                    SetupProgress::ShellStarted | SetupProgress::Closing(_) => {}
+                }
+                break reason;
+            },
         }
     };
 
@@ -703,6 +803,7 @@ struct SessionActor {
     output: TerminalOutput,
     timeouts: SessionTimeouts,
     timeout_warning: Option<TimeoutWarning>,
+    telemetry: Telemetry,
 }
 
 impl SessionActor {
@@ -712,6 +813,7 @@ impl SessionActor {
         source: Arc<dyn ContentSource>,
         handle: server::Handle,
         timeouts: SessionTimeouts,
+        telemetry: Telemetry,
     ) -> Result<Self, ActorError> {
         Ok(Self {
             size,
@@ -721,9 +823,10 @@ impl SessionActor {
             load_tasks: JoinSet::new(),
             pending_loads: VecDeque::new(),
             browser: Browser::new(),
-            output: TerminalOutput::new(size.area(), channel, handle)?,
+            output: TerminalOutput::new(size.area(), channel, handle, telemetry.clone())?,
             timeouts,
             timeout_warning: None,
+            telemetry,
         })
     }
 
@@ -747,6 +850,19 @@ impl SessionActor {
             .await;
         if input_excess.load(Ordering::Relaxed) {
             result = Err(ActorError::InputExcess);
+        }
+        match &result {
+            Err(ActorError::InputIdleTimeout) => {
+                self.telemetry.session_closed(SessionClosureKind::InputIdle)
+            }
+            Err(ActorError::MaximumLifetime) => self
+                .telemetry
+                .session_closed(SessionClosureKind::MaximumLifetime),
+            Err(ActorError::InputExcess) => {
+                self.telemetry.session_closed(SessionClosureKind::InputRate)
+            }
+            Err(ActorError::Terminal(_)) => self.telemetry.render_failed(),
+            Ok(()) | Err(ActorError::OutputClosed | ActorError::ClockRange) => {}
         }
         self.top_feed_task.abort_all();
         self.load_tasks.abort_all();
@@ -1180,6 +1296,7 @@ struct BrowsingSession {
     content: Arc<dyn ContentSource>,
     session_admission: SessionAdmission,
     session_timeouts: SessionTimeouts,
+    telemetry: Telemetry,
     input_rate: InputRateLimiter,
     input: Option<InputSender>,
     activity: Option<IdleActivity>,
@@ -1201,6 +1318,7 @@ impl BrowsingSession {
         scope: &SessionScope,
         session_admission: SessionAdmission,
         session_timeouts: SessionTimeouts,
+        telemetry: Telemetry,
     ) -> Self {
         Self {
             progress,
@@ -1211,6 +1329,7 @@ impl BrowsingSession {
             content,
             session_admission,
             session_timeouts,
+            telemetry,
             input_rate: InputRateLimiter::new(),
             input: None,
             activity: None,
@@ -1253,9 +1372,11 @@ impl BrowsingSession {
             Arc::clone(&self.content),
             session.handle(),
             self.session_timeouts.clone(),
+            self.telemetry.clone(),
         ) {
             Ok(actor) => actor,
             Err(error) => {
+                self.telemetry.render_failed();
                 debug!(%error, "could not initialize terminal");
                 session.data(channel, crate::terminal_output::LEAVE_SCREEN.to_vec())?;
                 return self.finish_without_actor(channel, 1, session);

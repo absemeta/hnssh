@@ -17,6 +17,7 @@ use crate::content::{
 };
 use crate::content_safety::{normalize_html, normalize_inline_text, validated_url};
 use crate::panic_reporting::report_join_error;
+use crate::telemetry::{Telemetry, UpstreamStatus};
 
 const PRODUCTION_ENDPOINT: &str = "https://hacker-news.firebaseio.com/v0";
 const POLL_OPTION_CONCURRENCY: usize = 8;
@@ -71,11 +72,20 @@ pub struct HackerNewsContent {
     options: Arc<HackerNewsOptions>,
     upstream_limit: Arc<Semaphore>,
     cache: Arc<SharedCache<ResourceKey, ResourceValue>>,
+    telemetry: Telemetry,
 }
 
 impl HackerNewsContent {
     pub fn production() -> Self {
         Self::for_endpoint(PRODUCTION_ENDPOINT)
+    }
+
+    pub(crate) fn production_with_telemetry(telemetry: Telemetry) -> Self {
+        Self::for_endpoint_with_options_and_telemetry(
+            PRODUCTION_ENDPOINT,
+            HackerNewsOptions::default(),
+            telemetry,
+        )
     }
 
     pub fn for_endpoint(endpoint: impl Into<String>) -> Self {
@@ -84,7 +94,16 @@ impl HackerNewsContent {
 
     pub fn for_endpoint_with_options(
         endpoint: impl Into<String>,
+        options: HackerNewsOptions,
+    ) -> Self {
+        let telemetry = Telemetry::new(&crate::admission::AdmissionLimits::default());
+        Self::for_endpoint_with_options_and_telemetry(endpoint, options, telemetry)
+    }
+
+    fn for_endpoint_with_options_and_telemetry(
+        endpoint: impl Into<String>,
         mut options: HackerNewsOptions,
+        telemetry: Telemetry,
     ) -> Self {
         options.maximum_cache_entries = options.maximum_cache_entries.max(1);
         options.maximum_cache_weight = options.maximum_cache_weight.max(1);
@@ -97,6 +116,7 @@ impl HackerNewsContent {
             options.maximum_cache_entries,
             options.maximum_cache_weight,
             options.revalidation_interval,
+            telemetry.clone(),
         ));
         let upstream_limit = Arc::new(Semaphore::new(options.upstream_concurrency));
 
@@ -106,6 +126,7 @@ impl HackerNewsContent {
             options: Arc::new(options),
             upstream_limit,
             cache,
+            telemetry,
         }
     }
 
@@ -117,6 +138,7 @@ impl HackerNewsContent {
             let client = self.client.clone();
             let limit = Arc::clone(&self.upstream_limit);
             let options = Arc::clone(&self.options);
+            let telemetry = self.telemetry.clone();
             let url = format!("{}/topstories.json", self.endpoint);
             let policy = CachePolicy {
                 fresh_for: self.options.top_feed_fresh_for,
@@ -125,7 +147,7 @@ impl HackerNewsContent {
             let snapshot = self
                 .cache
                 .read(ResourceKey::TopFeed, policy, request, async move {
-                    fetch_json(&client, &limit, &url, &options)
+                    fetch_json(&client, &limit, &url, &options, &telemetry)
                         .await
                         .map(ResourceValue::TopFeed)
                 })
@@ -145,6 +167,7 @@ impl HackerNewsContent {
         let client = self.client.clone();
         let limit = Arc::clone(&self.upstream_limit);
         let options = Arc::clone(&self.options);
+        let telemetry = self.telemetry.clone();
         let url = format!("{}/item/{id}.json", self.endpoint);
         let policy = CachePolicy {
             fresh_for: self.options.item_fresh_for,
@@ -153,7 +176,7 @@ impl HackerNewsContent {
         self.cache
             .read(ResourceKey::Item(id), policy, request, async move {
                 let item: Option<UpstreamItem> =
-                    fetch_json(&client, &limit, &url, &options).await?;
+                    fetch_json(&client, &limit, &url, &options, &telemetry).await?;
                 let fresh_for = item.as_ref().map_or(options.item_fresh_for, |item| {
                     item.cache_fresh_for(&options)
                 });
@@ -561,26 +584,41 @@ async fn fetch_json<T>(
     limit: &Semaphore,
     url: &str,
     options: &HackerNewsOptions,
+    telemetry: &Telemetry,
 ) -> Result<T, ContentError>
 where
     T: serde::de::DeserializeOwned,
 {
     for attempt in 0..=1 {
+        let started = Instant::now();
         let permit = limit.acquire().await.map_err(|_| ContentError::Retryable)?;
         let response = client.get(url).send().await;
         match response {
             Ok(response) if response.status().is_success() => {
                 let result = response.json().await.map_err(|_| ContentError::Unavailable);
+                telemetry.upstream_request(
+                    if result.is_ok() {
+                        UpstreamStatus::Success
+                    } else {
+                        UpstreamStatus::DecodeError
+                    },
+                    started.elapsed(),
+                );
                 drop(permit);
                 return result;
             }
             Ok(response) if retryable_status(response.status()) && attempt == 0 => {
+                let status = upstream_status(response.status());
                 let delay = retry_delay(&response, options);
+                telemetry.upstream_request(status, started.elapsed());
+                telemetry.upstream_retry();
                 drop(permit);
                 sleep(delay).await;
             }
             Ok(response) => {
-                let error = if retryable_status(response.status()) {
+                let status = response.status();
+                telemetry.upstream_request(upstream_status(status), started.elapsed());
+                let error = if retryable_status(status) {
                     ContentError::Retryable
                 } else {
                     ContentError::Unavailable
@@ -589,6 +627,8 @@ where
                 return Err(error);
             }
             Err(_) if attempt == 0 => {
+                telemetry.upstream_request(UpstreamStatus::TransportError, started.elapsed());
+                telemetry.upstream_retry();
                 drop(permit);
                 sleep(jittered_delay(
                     options.retry_base_delay,
@@ -597,12 +637,23 @@ where
                 .await;
             }
             Err(_) => {
+                telemetry.upstream_request(UpstreamStatus::TransportError, started.elapsed());
                 drop(permit);
                 return Err(ContentError::Retryable);
             }
         }
     }
     unreachable!("the retry loop always returns")
+}
+
+fn upstream_status(status: StatusCode) -> UpstreamStatus {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        UpstreamStatus::RateLimited
+    } else if status.is_server_error() {
+        UpstreamStatus::ServerError
+    } else {
+        UpstreamStatus::ClientError
+    }
 }
 
 fn retryable_status(status: StatusCode) -> bool {
@@ -829,6 +880,7 @@ struct SharedCache<K, V> {
     maximum_entries: usize,
     maximum_weight: usize,
     revalidation_interval: Duration,
+    telemetry: Telemetry,
 }
 
 impl<K, V> SharedCache<K, V>
@@ -836,12 +888,18 @@ where
     K: Clone + Eq + Hash + Send + 'static,
     V: Clone + Send + 'static,
 {
-    fn new(maximum_entries: usize, maximum_weight: usize, revalidation_interval: Duration) -> Self {
+    fn new(
+        maximum_entries: usize,
+        maximum_weight: usize,
+        revalidation_interval: Duration,
+        telemetry: Telemetry,
+    ) -> Self {
         Self {
             state: Mutex::new(CacheState::default()),
             maximum_entries,
             maximum_weight,
             revalidation_interval,
+            telemetry,
         }
     }
 
@@ -889,10 +947,16 @@ where
                         || (usable && throttled)
                     {
                         ready.last_access = state.next_access();
-                        immediate = Some(Ok(snapshot(&ready, policy, now)));
+                        let cached = snapshot(&ready, policy, now);
+                        self.telemetry.cache_hit();
+                        if cached.freshness.is_stale() {
+                            self.telemetry.cache_stale();
+                        }
+                        immediate = Some(Ok(cached));
                         state.entries.insert(key.clone(), CacheEntry::Ready(ready));
                     } else if request == CacheRequest::Read && usable {
                         ready.last_access = state.next_access();
+                        self.telemetry.cache_stale();
                         immediate = Some(Ok(ContentSnapshot::cached(
                             ready.value.clone(),
                             ContentFreshness::Stale { age },
@@ -941,13 +1005,16 @@ where
                     });
                     if request == CacheRequest::Read {
                         if let Some(stale) = stale {
+                            self.telemetry.cache_stale();
                             immediate = Some(Ok(stale));
                         } else {
+                            self.telemetry.cache_coalesced();
                             loading
                                 .waiters
                                 .push(sender.take().expect("loading request waiter"));
                         }
                     } else {
+                        self.telemetry.cache_coalesced();
                         loading
                             .waiters
                             .push(sender.take().expect("loading revalidation waiter"));
@@ -1044,6 +1111,7 @@ where
                             stale.last_access = state.next_access();
                             let value = stale.value.clone();
                             state.entries.insert(key, CacheEntry::Ready(stale));
+                            self.telemetry.cache_stale();
                             self.enforce_bounds(&mut state);
                             (
                                 waiters,
@@ -1115,8 +1183,11 @@ where
             let Some(oldest) = oldest else {
                 break;
             };
-            if let Some(CacheEntry::Ready(ready)) = state.entries.remove(&oldest) {
-                state.total_weight = state.total_weight.saturating_sub(ready.weight);
+            if let Some(evicted) = state.entries.remove(&oldest) {
+                if let CacheEntry::Ready(ready) = evicted {
+                    state.total_weight = state.total_weight.saturating_sub(ready.weight);
+                }
+                self.telemetry.cache_evicted();
             }
         }
     }

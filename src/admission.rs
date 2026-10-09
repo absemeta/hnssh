@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -17,8 +17,13 @@ use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::Instant;
 
+use crate::telemetry::Telemetry;
+
 const MAXIMUM_SOURCE_BUCKETS: usize = 65_536;
 const SOURCE_KEY_ROTATION: Duration = Duration::from_secs(60 * 60);
+const SECONDS_PER_UTC_DAY: u64 = 24 * 60 * 60;
+const HYPERLOGLOG_PRECISION: u32 = 10;
+const HYPERLOGLOG_REGISTERS: usize = 1 << HYPERLOGLOG_PRECISION;
 
 #[derive(Clone, Debug)]
 pub struct AdmissionLimits {
@@ -60,34 +65,62 @@ pub(crate) struct Admission {
     source: Arc<SourceAdmission>,
     handshakes: Arc<Semaphore>,
     sessions: Arc<Semaphore>,
+    telemetry: Telemetry,
 }
 
 impl Admission {
+    #[cfg(test)]
     pub(crate) fn new(limits: AdmissionLimits) -> Result<Self, AdmissionError> {
+        let telemetry = Telemetry::new(&limits);
+        Self::new_with_telemetry(limits, telemetry)
+    }
+
+    pub(crate) fn new_with_telemetry(
+        limits: AdmissionLimits,
+        telemetry: Telemetry,
+    ) -> Result<Self, AdmissionError> {
         validate_limits(&limits)?;
         let source = Arc::new(SourceAdmission::new(&limits)?);
         Ok(Self {
             source,
             handshakes: Arc::new(Semaphore::new(limits.maximum_handshakes)),
             sessions: Arc::new(Semaphore::new(limits.maximum_browsing_sessions)),
+            telemetry,
         })
     }
 
     /// Admit one TCP peer without allowing its address to leave this call.
     pub(crate) fn admit(&self, peer: SocketAddr) -> Option<ConnectionAdmission> {
+        self.telemetry.connection_attempted();
+        self.source
+            .observe_visitor(peer.ip(), SystemTime::now(), &self.telemetry);
+
         // Charge source policy even when global capacity is exhausted. The
         // source table has its own hard cap, so this ordering cannot recreate
         // unbounded state under a distributed flood.
-        let source = self.source.admit(peer.ip(), Instant::now())?;
-        let handshake = Arc::clone(&self.handshakes).try_acquire_owned().ok()?;
-        let handshake = HandshakePermitOwner::new(handshake);
-        let established = SessionPermitOwner::new();
+        let source = match self.source.admit(peer.ip(), Instant::now()) {
+            Some(source) => source,
+            None => {
+                self.telemetry.source_rejected();
+                return None;
+            }
+        };
+        let handshake = match Arc::clone(&self.handshakes).try_acquire_owned() {
+            Ok(handshake) => handshake,
+            Err(_) => {
+                self.telemetry.handshake_rejected();
+                return None;
+            }
+        };
+        let handshake = HandshakePermitOwner::new(handshake, self.telemetry.clone());
+        let established = SessionPermitOwner::new(self.telemetry.clone());
         Some(ConnectionAdmission {
             _source: source,
             session: SessionAdmission {
                 handshake: handshake.release_handle(),
                 established: established.install_handle(),
                 sessions: Arc::clone(&self.sessions),
+                telemetry: self.telemetry.clone(),
             },
             _handshake: handshake,
             _established: established,
@@ -177,66 +210,81 @@ impl ConnectionAdmission {
 
 struct HandshakePermitOwner {
     permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    telemetry: Telemetry,
 }
 
 impl HandshakePermitOwner {
-    fn new(permit: OwnedSemaphorePermit) -> Self {
+    fn new(permit: OwnedSemaphorePermit, telemetry: Telemetry) -> Self {
+        telemetry.handshake_accepted();
         Self {
             permit: Arc::new(Mutex::new(Some(permit))),
+            telemetry,
         }
     }
 
     fn release_handle(&self) -> HandshakeRelease {
         HandshakeRelease {
             permit: Arc::clone(&self.permit),
+            telemetry: self.telemetry.clone(),
         }
     }
 }
 
 impl Drop for HandshakePermitOwner {
     fn drop(&mut self) {
-        lock_unpoisoned(&self.permit).take();
+        if lock_unpoisoned(&self.permit).take().is_some() {
+            self.telemetry.handshake_ended();
+        }
     }
 }
 
 #[derive(Clone)]
 struct HandshakeRelease {
     permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    telemetry: Telemetry,
 }
 
 impl HandshakeRelease {
     fn release(&self) {
-        lock_unpoisoned(&self.permit).take();
+        if lock_unpoisoned(&self.permit).take().is_some() {
+            self.telemetry.handshake_ended();
+        }
     }
 }
 
 struct SessionPermitOwner {
     permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    telemetry: Telemetry,
 }
 
 impl SessionPermitOwner {
-    fn new() -> Self {
+    fn new(telemetry: Telemetry) -> Self {
         Self {
             permit: Arc::new(Mutex::new(None)),
+            telemetry,
         }
     }
 
     fn install_handle(&self) -> SessionPermitInstall {
         SessionPermitInstall {
             permit: Arc::clone(&self.permit),
+            telemetry: self.telemetry.clone(),
         }
     }
 }
 
 impl Drop for SessionPermitOwner {
     fn drop(&mut self) {
-        lock_unpoisoned(&self.permit).take();
+        if lock_unpoisoned(&self.permit).take().is_some() {
+            self.telemetry.session_ended();
+        }
     }
 }
 
 #[derive(Clone)]
 struct SessionPermitInstall {
     permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    telemetry: Telemetry,
 }
 
 impl SessionPermitInstall {
@@ -245,6 +293,7 @@ impl SessionPermitInstall {
         if slot.is_some() {
             return false;
         }
+        self.telemetry.session_accepted();
         *slot = Some(permit);
         true
     }
@@ -255,6 +304,7 @@ pub(crate) struct SessionAdmission {
     handshake: HandshakeRelease,
     established: SessionPermitInstall,
     sessions: Arc<Semaphore>,
+    telemetry: Telemetry,
 }
 
 impl SessionAdmission {
@@ -262,7 +312,11 @@ impl SessionAdmission {
     /// handshake remains charged until [`Self::establish`] runs after the actor
     /// has been fully installed in its lifecycle scope.
     pub(crate) fn try_reserve(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
-        Arc::clone(&self.sessions).try_acquire_owned()
+        let result = Arc::clone(&self.sessions).try_acquire_owned();
+        if result.is_err() {
+            self.telemetry.session_rejected();
+        }
+        result
     }
 
     pub(crate) fn establish(&self, permit: OwnedSemaphorePermit) -> bool {
@@ -296,6 +350,7 @@ struct SourceState {
 struct SourceAdmission {
     root_key: hmac::Key,
     state: Mutex<SourceState>,
+    daily_visitors: Mutex<DailyVisitors>,
     maximum_connections: usize,
     maximum_buckets: usize,
     attempts_per_window: f64,
@@ -330,6 +385,7 @@ impl SourceAdmission {
                 buckets: HashMap::new(),
                 active_hours: HashMap::new(),
             }),
+            daily_visitors: Mutex::new(DailyVisitors::new()),
             maximum_connections: limits.maximum_connections_per_source,
             maximum_buckets: limits.maximum_source_buckets,
             attempts_per_window: f64::from(limits.source_attempts_per_window),
@@ -431,30 +487,26 @@ impl SourceAdmission {
     fn transform(&self, source: IpAddr, hour: u64) -> SourceKey {
         let hour_key = hmac::sign(&self.root_key, &hour.to_be_bytes());
         let hour_key = hmac::Key::new(hmac::HMAC_SHA256, hour_key.as_ref());
-        let mut normalized = [0_u8; 17];
-        let length = match source {
-            IpAddr::V4(address) => {
-                normalized[0] = 4;
-                normalized[1..5].copy_from_slice(&address.octets());
-                5
-            }
-            IpAddr::V6(address) => {
-                if let Some(address) = address.to_ipv4_mapped() {
-                    normalized[0] = 4;
-                    normalized[1..5].copy_from_slice(&address.octets());
-                    5
-                } else {
-                    normalized[0] = 6;
-                    normalized[1..].copy_from_slice(&address.octets());
-                    normalized.len()
-                }
-            }
-        };
+        let (mut normalized, length) = normalized_source(source);
         let tag = hmac::sign(&hour_key, &normalized[..length]);
         let mut value = [0_u8; 32];
         value.copy_from_slice(tag.as_ref());
         normalized.fill(0);
         SourceKey(value)
+    }
+
+    fn observe_visitor(
+        &self,
+        source: IpAddr,
+        now: SystemTime,
+        telemetry: &Telemetry,
+    ) -> DailyVisitorCounts {
+        let mut visitors = lock_unpoisoned(&self.daily_visitors);
+        let counts = visitors.observe(&self.root_key, source, now);
+        // Publish before releasing the sketch lock so concurrent observations
+        // cannot make the aggregate estimate move backwards.
+        telemetry.set_daily_visitors(counts.current, counts.previous);
+        counts
     }
 
     fn release(&self, key: SourceKey) {
@@ -485,6 +537,119 @@ impl SourceAdmission {
     fn prune_expired(&self, now: Instant) {
         prune_state(&mut lock_unpoisoned(&self.state), now);
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DailyVisitorCounts {
+    current: u64,
+    previous: u64,
+}
+
+struct DailyVisitors {
+    day: Option<u64>,
+    registers: Box<[u8; HYPERLOGLOG_REGISTERS]>,
+    previous_estimate: u64,
+}
+
+impl DailyVisitors {
+    fn new() -> Self {
+        Self {
+            day: None,
+            registers: Box::new([0; HYPERLOGLOG_REGISTERS]),
+            previous_estimate: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        root_key: &hmac::Key,
+        source: IpAddr,
+        now: SystemTime,
+    ) -> DailyVisitorCounts {
+        let observed_day = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs()
+            / SECONDS_PER_UTC_DAY;
+        let day = match self.day {
+            Some(current) if observed_day <= current => current,
+            Some(_) => {
+                self.previous_estimate = hyperloglog_estimate(&self.registers);
+                self.registers.fill(0);
+                self.day = Some(observed_day);
+                observed_day
+            }
+            None => {
+                self.day = Some(observed_day);
+                observed_day
+            }
+        };
+
+        let mut key_material = [0_u8; 21];
+        key_material[..13].copy_from_slice(b"daily-visitor");
+        key_material[13..].copy_from_slice(&day.to_be_bytes());
+        let day_key = hmac::sign(root_key, &key_material);
+        let day_key = hmac::Key::new(hmac::HMAC_SHA256, day_key.as_ref());
+        key_material.fill(0);
+        let (mut normalized, length) = normalized_source(source);
+        let tag = hmac::sign(&day_key, &normalized[..length]);
+        normalized.fill(0);
+
+        let hash = u64::from_be_bytes(tag.as_ref()[..8].try_into().expect("HMAC prefix"));
+        let register = (hash >> (64 - HYPERLOGLOG_PRECISION)) as usize;
+        let remaining = hash << HYPERLOGLOG_PRECISION;
+        let maximum_rank = 64 - HYPERLOGLOG_PRECISION + 1;
+        let rank = remaining
+            .leading_zeros()
+            .saturating_add(1)
+            .min(maximum_rank) as u8;
+        self.registers[register] = self.registers[register].max(rank);
+
+        DailyVisitorCounts {
+            current: hyperloglog_estimate(&self.registers),
+            previous: self.previous_estimate,
+        }
+    }
+}
+
+fn hyperloglog_estimate(registers: &[u8; HYPERLOGLOG_REGISTERS]) -> u64 {
+    let register_count = HYPERLOGLOG_REGISTERS as f64;
+    let alpha = 0.7213 / (1.0 + 1.079 / register_count);
+    let harmonic_sum = registers
+        .iter()
+        .map(|rank| 2_f64.powi(-i32::from(*rank)))
+        .sum::<f64>();
+    let raw = alpha * register_count * register_count / harmonic_sum;
+    let empty = registers.iter().filter(|rank| **rank == 0).count();
+    let corrected = if raw <= 2.5 * register_count && empty > 0 {
+        register_count * (register_count / empty as f64).ln()
+    } else {
+        raw
+    };
+    corrected.round().max(0.0) as u64
+}
+
+fn normalized_source(source: IpAddr) -> ([u8; 17], usize) {
+    let mut normalized = [0_u8; 17];
+    let length = match source {
+        IpAddr::V4(address) => {
+            normalized[0] = 4;
+            normalized[1..5].copy_from_slice(&address.octets());
+            5
+        }
+        IpAddr::V6(address) => {
+            if let Some(address) = address.to_ipv4_mapped() {
+                normalized[0] = 4;
+                normalized[1..5].copy_from_slice(&address.octets());
+                5
+            } else {
+                normalized[0] = 6;
+                normalized[1..].copy_from_slice(&address.octets());
+                normalized.len()
+            }
+        }
+    };
+    (normalized, length)
 }
 
 fn prune_state(state: &mut SourceState, now: Instant) {
@@ -551,6 +716,40 @@ mod tests {
 
         assert!(source.transform(ipv4, 10) == source.transform(mapped, 10));
         assert!(source.transform(ipv4, 10) != source.transform(ipv4, 11));
+    }
+
+    #[test]
+    fn daily_visitor_sketch_deduplicates_and_discards_completed_day_registers() {
+        let source = SourceAdmission::new(&limits()).expect("admission");
+        let telemetry = Telemetry::new(&limits());
+        let first_day = SystemTime::UNIX_EPOCH + Duration::from_secs(100 * SECONDS_PER_UTC_DAY);
+        let address = Ipv4Addr::new(192, 0, 2, 9);
+        let first = source.observe_visitor(IpAddr::V4(address), first_day, &telemetry);
+        let duplicate = source.observe_visitor(
+            IpAddr::V6(address.to_ipv6_mapped()),
+            first_day + Duration::from_secs(60),
+            &telemetry,
+        );
+        assert_eq!(first.current, 1);
+        assert_eq!(duplicate.current, 1);
+        assert_eq!(duplicate.previous, 0);
+
+        let next_day = source.observe_visitor(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+            first_day + Duration::from_secs(SECONDS_PER_UTC_DAY),
+            &telemetry,
+        );
+        assert_eq!(next_day.current, 1);
+        assert_eq!(next_day.previous, 1);
+        assert_eq!(
+            lock_unpoisoned(&source.daily_visitors)
+                .registers
+                .iter()
+                .filter(|register| **register != 0)
+                .count(),
+            1,
+            "only the new day's sketch remains after rotation"
+        );
     }
 
     #[test]

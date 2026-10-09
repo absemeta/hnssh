@@ -1,0 +1,15 @@
+[Unit]
+Description=HNSSH public SSH listener
+
+[Socket]
+# One explicit dual-stack listener is passed as fd 3. HNSSH accepts connections
+# itself (Accept=no), so it retains the real IPv4/IPv6 peer address.
+ListenStream=22
+BindIPv6Only=both
+Accept=no
+FileDescriptorName=ssh
+Backlog=256
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

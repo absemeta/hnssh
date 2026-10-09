@@ -20,6 +20,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::panic_reporting::report_join_error;
+use crate::telemetry::Telemetry;
 use crate::ui::{RenderOutput, TerminalHyperlink};
 
 // ST closes a possibly partial OSC from a cancelled frame; explicitly close
@@ -129,6 +130,7 @@ impl TerminalOutput {
         area: Rect,
         channel: ChannelWriteHalf<server::Msg>,
         handle: server::Handle,
+        telemetry: Telemetry,
     ) -> io::Result<Self> {
         let terminal = Terminal::with_options(
             ViewportBackend::new(area),
@@ -142,7 +144,7 @@ impl TerminalOutput {
         let failure = failed.clone();
         let mut writer = JoinSet::new();
         writer.spawn(async move {
-            write_frames(channel, handle, frames, finished, failure).await;
+            write_frames(channel, handle, frames, finished, failure, telemetry).await;
         });
         Ok(Self {
             terminal,
@@ -199,6 +201,7 @@ async fn write_frames(
     mut frames: watch::Receiver<Option<Arc<CompleteFrame>>>,
     mut finished: oneshot::Receiver<(u32, Vec<u8>)>,
     failed: CancellationToken,
+    telemetry: Telemetry,
 ) {
     let mut previous: Option<Arc<CompleteFrame>> = None;
     let mut entering = true;
@@ -215,6 +218,7 @@ async fn write_frames(
         let bytes = match encode_frame(previous.as_deref(), &next, entering) {
             Ok(bytes) => bytes,
             Err(_) => {
+                telemetry.render_failed();
                 failed.cancel();
                 break (1, Vec::new());
             }
@@ -228,6 +232,7 @@ async fn write_frames(
             sent = channel.data_bytes(bytes) => sent,
         };
         if sent.is_err() {
+            telemetry.send_failed();
             failed.cancel();
             break (1, Vec::new());
         }

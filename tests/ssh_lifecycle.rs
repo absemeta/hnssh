@@ -66,6 +66,7 @@ impl client::Handler for TrustExpectedHostKey {
 
 struct TestServer {
     address: SocketAddr,
+    operations_address: SocketAddr,
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<Result<(), hnssh::ServerError>>,
     _key_dir: TempDir,
@@ -95,6 +96,7 @@ impl TestServer {
         let server = Server::bind_with_content(
             ServerConfig {
                 listen_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                operations_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
                 host_key_path,
                 admission_limits,
                 session_timeouts,
@@ -103,11 +105,13 @@ impl TestServer {
         )
         .await?;
         let address = server.local_addr()?;
+        let operations_address = server.operations_addr();
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(server.run(shutdown.clone()));
 
         Ok(Self {
             address,
+            operations_address,
             shutdown,
             task,
             _key_dir: key_dir,
@@ -586,9 +590,13 @@ fn make_host_key() -> TestResult<(TempDir, PathBuf, ssh_key::PublicKey)> {
 }
 
 async fn raw_connection_from(server: &TestServer, source: Ipv4Addr) -> TestResult<TcpStream> {
+    raw_connection_to_from(server.address, source).await
+}
+
+async fn raw_connection_to_from(address: SocketAddr, source: Ipv4Addr) -> TestResult<TcpStream> {
     let socket = tokio::net::TcpSocket::new_v4()?;
     socket.bind(SocketAddr::new(IpAddr::V4(source), 0))?;
-    Ok(socket.connect(server.address).await?)
+    Ok(socket.connect(address).await?)
 }
 
 async fn read_connection_greeting(stream: &mut TcpStream) -> TestResult<String> {
@@ -605,6 +613,13 @@ async fn read_connection_greeting(stream: &mut TcpStream) -> TestResult<String> 
     })
     .await??;
     Ok(String::from_utf8(greeting)?)
+}
+
+async fn operations_get(address: SocketAddr, path: &str) -> TestResult<(StatusCode, String)> {
+    let response = reqwest::get(format!("http://{address}{path}")).await?;
+    let status = response.status();
+    let body = response.text().await?;
+    Ok((status, body))
 }
 
 async fn expect_success(channel: &mut Channel<client::Msg>) -> TestResult {
@@ -804,6 +819,220 @@ async fn read_through_close(
 }
 
 #[tokio::test]
+async fn operations_listener_transitions_to_ready_and_exposes_only_aggregate_health() -> TestResult
+{
+    let (_key_dir, host_key_path, _) = make_host_key()?;
+    let server = Server::bind_with_content(
+        ServerConfig {
+            listen_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            operations_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            host_key_path,
+            admission_limits: AdmissionLimits::default(),
+            session_timeouts: SessionTimeouts::default(),
+        },
+        Arc::new(FixtureContent::default()),
+    )
+    .await?;
+    let operations_address = server.operations_addr();
+
+    let (status, body) = operations_get(operations_address, "/livez").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "live\n");
+    let (status, body) = operations_get(operations_address, "/readyz").await?;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, "not ready\n");
+
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(server.run(shutdown.clone()));
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            let (status, _) = operations_get(operations_address, "/readyz").await?;
+            if status == StatusCode::OK {
+                return Ok::<_, Box<dyn std::error::Error>>(());
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await??;
+
+    let private_metadata = "private-user-term-title-url-marker";
+    let (status, metrics) = operations_get(
+        operations_address,
+        &format!("/metrics?ignored={private_metadata}"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(metrics.contains("hnssh_build_info"));
+    assert!(metrics.contains("hnssh_runtime_ready 1"));
+    assert!(metrics.contains("hnssh_daily_visitors_estimate"));
+    assert!(!metrics.contains(private_metadata));
+
+    shutdown.cancel();
+    timeout(TEST_TIMEOUT, task).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn inherited_listener_uses_the_real_peer_for_source_admission() -> TestResult {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let address = listener.local_addr()?;
+    let (_key_dir, host_key_path, _) = make_host_key()?;
+    let server = Server::from_listener_with_content(
+        ServerConfig {
+            // Reusing this occupied address proves startup did not try to bind it.
+            listen_address: address,
+            operations_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            host_key_path,
+            admission_limits: AdmissionLimits {
+                maximum_connections_per_source: 1,
+                source_attempts_per_window: 100,
+                source_attempt_burst: 100,
+                ..AdmissionLimits::default()
+            },
+            session_timeouts: SessionTimeouts::default(),
+        },
+        listener,
+        Arc::new(FixtureContent::default()),
+    )
+    .await?;
+    assert_eq!(server.local_addr()?, address);
+    let operations_address = server.operations_addr();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(server.run(shutdown.clone()));
+
+    let first_source = Ipv4Addr::LOCALHOST;
+    let mut first = raw_connection_to_from(address, first_source).await?;
+    assert!(
+        read_connection_greeting(&mut first)
+            .await?
+            .starts_with("SSH-2.0-")
+    );
+    let mut same_source = raw_connection_to_from(address, first_source).await?;
+    assert!(
+        read_connection_greeting(&mut same_source)
+            .await?
+            .contains("busy")
+    );
+
+    // Linux configures the whole 127.0.0.0/8 loopback range. When available,
+    // prove the inherited accept path distinguishes the actual second source.
+    let other_source = Ipv4Addr::new(127, 0, 0, 2);
+    let probe = tokio::net::TcpSocket::new_v4()?;
+    let other = if probe
+        .bind(SocketAddr::new(IpAddr::V4(other_source), 0))
+        .is_ok()
+    {
+        drop(probe);
+        let mut stream = raw_connection_to_from(address, other_source).await?;
+        assert!(
+            read_connection_greeting(&mut stream)
+                .await?
+                .starts_with("SSH-2.0-")
+        );
+        Some(stream)
+    } else {
+        None
+    };
+
+    let (_, metrics) = operations_get(operations_address, "/metrics").await?;
+    assert!(metrics.contains("hnssh_admission_rejections_total{reason=\"source\"} 1"));
+
+    drop((first, same_source, other));
+    shutdown.cancel();
+    timeout(TEST_TIMEOUT, task).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn operations_metrics_report_capacity_rejection_without_source_values() -> TestResult {
+    let limits = AdmissionLimits {
+        maximum_handshakes: 1,
+        maximum_browsing_sessions: 1,
+        maximum_connections_per_source: 10,
+        maximum_source_buckets: 20,
+        source_attempts_per_window: 100,
+        source_attempt_burst: 100,
+        source_attempt_window: Duration::from_secs(60),
+    };
+    let server = TestServer::start_with_policy(
+        Arc::new(FixtureContent::default()),
+        limits,
+        SessionTimeouts::default(),
+    )
+    .await?;
+    let mut held = TcpStream::connect(server.address).await?;
+    assert!(
+        read_connection_greeting(&mut held)
+            .await?
+            .starts_with("SSH-2.0-")
+    );
+    let mut rejected = TcpStream::connect(server.address).await?;
+    assert!(
+        read_connection_greeting(&mut rejected)
+            .await?
+            .contains("busy")
+    );
+
+    let (_, metrics) = operations_get(server.operations_address, "/metrics").await?;
+    assert!(metrics.contains("hnssh_active_handshakes 1"));
+    assert!(metrics.contains("hnssh_admission_rejections_total{reason=\"handshake_capacity\"} 1"));
+    assert!(metrics.contains("hnssh_connections_total{outcome=\"attempted\"} 2"));
+    assert!(metrics.contains("hnssh_daily_visitors_estimate{period=\"current\"} 1"));
+    assert!(!metrics.contains(&server.address.ip().to_string()));
+
+    drop((held, rejected));
+    let (connection, mut channel, _terminal, mut output) = timeout(TEST_TIMEOUT, async {
+        loop {
+            match open_terminal(&server).await {
+                Ok(visitor) => return visitor,
+                Err(_) => sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await?;
+    let (_, metrics) = operations_get(server.operations_address, "/metrics").await?;
+    assert!(metrics.contains("hnssh_active_handshakes 0"));
+    assert!(metrics.contains("hnssh_active_sessions 1"));
+    assert!(metrics.contains("hnssh_connections_total{outcome=\"session_accepted\"} 1"));
+
+    channel.data_bytes(b"q".as_slice()).await?;
+    assert_eq!(read_through_close(&mut channel, &mut output).await?, 0);
+    drop(connection);
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            let (_, metrics) = operations_get(server.operations_address, "/metrics").await?;
+            if metrics.contains("hnssh_active_sessions 0") {
+                return Ok::<_, Box<dyn std::error::Error>>(());
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await??;
+    server.stop().await
+}
+
+#[tokio::test]
+async fn operations_listener_rejects_non_loopback_configuration() -> TestResult {
+    let (_key_dir, host_key_path, _) = make_host_key()?;
+    let result = Server::bind_with_content(
+        ServerConfig {
+            listen_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            operations_address: SocketAddr::from(([0, 0, 0, 0], 9090)),
+            host_key_path,
+            admission_limits: AdmissionLimits::default(),
+            session_timeouts: SessionTimeouts::default(),
+        },
+        Arc::new(FixtureContent::default()),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(ServerError::PublicOperationsAddress(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn invalid_operator_limits_return_typed_startup_errors_instead_of_panicking() -> TestResult {
     let (_key_dir, host_key_path, _) = make_host_key()?;
     let invalid_admission = [
@@ -837,6 +1066,7 @@ async fn invalid_operator_limits_return_typed_startup_errors_instead_of_panickin
         let result = Server::bind_with_content(
             ServerConfig {
                 listen_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                operations_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
                 host_key_path: host_key_path.clone(),
                 admission_limits,
                 session_timeouts: SessionTimeouts::default(),
@@ -864,6 +1094,7 @@ async fn invalid_operator_limits_return_typed_startup_errors_instead_of_panickin
         let result = Server::bind_with_content(
             ServerConfig {
                 listen_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                operations_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
                 host_key_path: host_key_path.clone(),
                 admission_limits: AdmissionLimits::default(),
                 session_timeouts,

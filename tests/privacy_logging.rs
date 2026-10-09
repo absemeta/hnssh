@@ -1,14 +1,16 @@
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use hnssh::{
-    AdmissionLimits, FixtureContent, Server, ServerConfig, SessionTimeouts,
-    privacy_safe_process_entry,
+    AdmissionLimits, ContentError, ContentSnapshot, ContentSource, EntryDetails, FeedEntry,
+    FeedEntryId, Link, Server, ServerConfig, SessionTimeouts, privacy_safe_process_entry,
 };
 use russh::client;
 use russh::keys::{Algorithm, PrivateKey, ssh_key};
@@ -16,7 +18,7 @@ use russh::{Channel, ChannelMsg};
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::field::{Field, Visit};
@@ -24,12 +26,19 @@ use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const PRIVATE_ENTRY_ID: FeedEntryId = 9_007_199_254_740_991;
+const PRIVATE_TITLE: &str = "round4-private-content-title";
+const PRIVATE_AUTHOR: &str = "round4-private-content-author";
+const PRIVATE_URL: &str = "https://round4-private.example/secret-path";
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// Every field name HNSSH is allowed to emit. A source key can only escape if
 /// code adds a new field, which makes this test fail and forces review.
 const ALLOWED_LOG_FIELDS: &[&str] = &[
     "listener.address",
+    "operations.address",
+    "operations.failure",
+    "upstream.status",
     "task.scope",
     "task.failure",
     "error",
@@ -94,6 +103,55 @@ fn recorded_events() -> FieldRecorder {
             recorder
         })
         .clone()
+}
+
+struct PrivacyContent {
+    loaded: Arc<Notify>,
+}
+
+impl ContentSource for PrivacyContent {
+    fn top_feed(
+        &self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<ContentSnapshot<Vec<FeedEntryId>>, ContentError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(ContentSnapshot::fresh(vec![PRIVATE_ENTRY_ID])) })
+    }
+
+    fn feed_entry(
+        &self,
+        id: FeedEntryId,
+    ) -> Pin<Box<dyn Future<Output = Result<ContentSnapshot<FeedEntry>, ContentError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            if id != PRIVATE_ENTRY_ID {
+                return Err(ContentError::Unavailable);
+            }
+            self.loaded.notify_one();
+            let primary_link = Link {
+                label: PRIVATE_TITLE.to_owned(),
+                destination: PRIVATE_URL.to_owned(),
+            };
+            Ok(ContentSnapshot::fresh(FeedEntry::Story(EntryDetails {
+                id,
+                source: Some("round4-private-content-source".to_owned()),
+                primary_link: Some(primary_link.clone()),
+                links: vec![primary_link],
+                title: Some(PRIVATE_TITLE.to_owned()),
+                score: Some(1),
+                author: Some(PRIVATE_AUTHOR.to_owned()),
+                published_at: None,
+                comment_count: Some(0),
+                comment_ids: Vec::new(),
+                text: None,
+                omitted_link_count: 0,
+            })))
+        })
+    }
 }
 
 struct PanickingWriter;
@@ -228,6 +286,7 @@ fn assert_allowlisted_schema(
     events: &[RecordedEvent],
     listen_address: SocketAddr,
     private_username: &str,
+    private_terminal: &str,
 ) {
     assert!(
         !events.is_empty(),
@@ -241,6 +300,7 @@ fn assert_allowlisted_schema(
         "session teardown was not observed: {events:#?}"
     );
     let peer_text = listen_address.ip().to_string();
+    let private_entry_id = PRIVATE_ENTRY_ID.to_string();
     for event in events {
         assert!(
             event.target.starts_with("hnssh"),
@@ -253,10 +313,19 @@ fn assert_allowlisted_schema(
                 "log schema gained an unallowlisted field {name:?}; source-key material \
                  could now escape: {events:#?}"
             );
-            assert!(
-                !value.contains(private_username),
-                "SSH username {private_username:?} escaped through field {name:?}"
-            );
+            for private in [
+                private_username,
+                private_terminal,
+                PRIVATE_TITLE,
+                PRIVATE_AUTHOR,
+                PRIVATE_URL,
+                private_entry_id.as_str(),
+            ] {
+                assert!(
+                    !value.contains(private),
+                    "private visitor/content value {private:?} escaped through field {name:?}"
+                );
+            }
             if name != "listener.address" {
                 assert!(
                     !value.contains(&peer_text),
@@ -277,13 +346,16 @@ fn ipv6_loopback_available() -> bool {
 
 async fn rejection_and_teardown_schema(listen_address: SocketAddr) -> TestResult<()> {
     let private_username = "round4-private-visitor-name";
+    let private_terminal = "round4-private-terminal-\u{1b}[31m-\u{202e}";
     let recorder = recorded_events();
     let observed_before = recorder.events().len();
 
     let (_key_directory, host_key_path, public_key) = make_host_key()?;
+    let content_loaded = Arc::new(Notify::new());
     let server = Server::bind_with_content(
         ServerConfig {
             listen_address,
+            operations_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             host_key_path,
             admission_limits: AdmissionLimits {
                 maximum_handshakes: 1,
@@ -296,10 +368,13 @@ async fn rejection_and_teardown_schema(listen_address: SocketAddr) -> TestResult
             },
             session_timeouts: SessionTimeouts::default(),
         },
-        Arc::new(FixtureContent::default()),
+        Arc::new(PrivacyContent {
+            loaded: Arc::clone(&content_loaded),
+        }),
     )
     .await?;
     let address = server.local_addr()?;
+    let operations_address = server.operations_addr();
     assert_eq!(address.ip(), listen_address.ip());
     let shutdown = CancellationToken::new();
     let task = tokio::spawn(server.run(shutdown.clone()));
@@ -332,17 +407,48 @@ async fn rejection_and_teardown_schema(listen_address: SocketAddr) -> TestResult
             .success()
     );
     let mut channel = connection.channel_open_session().await?;
+    channel
+        .request_pty(true, private_terminal, 80, 24, 0, 0, &[])
+        .await?;
+    expect_success(&mut channel).await?;
     channel.request_shell(true).await?;
     expect_success(&mut channel).await?;
+    timeout(TEST_TIMEOUT, content_loaded.notified()).await?;
+    channel.data_bytes(b"q".as_slice()).await?;
     let channel_output = read_close(&mut channel).await?;
-    assert!(String::from_utf8_lossy(&channel_output).contains("interactive terminal"));
+    assert!(!channel_output.is_empty());
     timeout(TEST_TIMEOUT, disconnected).await??;
     drop(connection);
+
+    let metrics = reqwest::get(format!(
+        "http://{operations_address}/metrics?visitor={private_username}"
+    ))
+    .await?
+    .text()
+    .await?;
+    let private_source = address.ip().to_string();
+    let private_entry_id = PRIVATE_ENTRY_ID.to_string();
+    for private in [
+        private_username,
+        private_terminal,
+        private_source.as_str(),
+        PRIVATE_TITLE,
+        PRIVATE_AUTHOR,
+        PRIVATE_URL,
+        private_entry_id.as_str(),
+    ] {
+        assert!(
+            !metrics.contains(private),
+            "private visitor value {private:?} escaped through metrics"
+        );
+    }
+    assert!(!contains_key_shaped_token(&metrics));
+
     shutdown.cancel();
     timeout(TEST_TIMEOUT, task).await???;
 
     let events = recorder.events()[observed_before..].to_vec();
-    assert_allowlisted_schema(&events, address, private_username);
+    assert_allowlisted_schema(&events, address, private_username, private_terminal);
     Ok(())
 }
 

@@ -1,0 +1,48 @@
+[Unit]
+Description=HNSSH anonymous Hacker News browser
+Requires=hnssh.socket
+After=hnssh.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hnssh
+Group=hnssh
+ExecStart=/opt/hnssh/current/hnssh --host-key /etc/hnssh/host-key --operations-address 127.0.0.1:9090
+Environment=RUST_LOG=hnssh=info
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+UMask=0077
+
+# Port 22 is already open when HNSSH starts; the process needs no capability.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# HNSSH has no persistent writable application state. Its host key and release
+# are root-provisioned, read-only inputs; only a service-private /tmp is writable.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+KeyringMode=private
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
