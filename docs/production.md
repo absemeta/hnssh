@@ -126,6 +126,26 @@ binary uses `--listen-address`/`HNSSH_LISTEN_ADDRESS` for development. A partial
 or malformed activation environment fails startup rather than silently choosing
 a different production listener.
 
+Before touching a real host, rehearse the topology on a disposable Linux VM
+with systemd as PID 1. The validation is intentionally destructive: it creates
+service identities and test keys, moves the VM's OpenSSH off port 22, installs
+under `/opt/hnssh` and `/etc/hnssh`, and removes those test assets when it exits.
+Never run it on an administrative or production machine.
+
+```sh
+cargo build --release --locked
+sudo env HNSSH_DISPOSABLE_VM=1 \
+  ./deploy/validate-production-topology.sh ./target/release/hnssh
+```
+
+The gate proves a fresh key-only administrative connection before cutover,
+native socket activation, real peer-address admission, IPv4/IPv6 host identity,
+loopback-only operations, the running sandbox and empty capability sets, a real
+anonymous OpenSSH browsing journey, restart fingerprint stability, and recovery
+of the separate administrative route. CI runs the same gate on a disposable
+Ubuntu VM. This does not replace provider firewall inspection or the independent
+provider-console exercise required below.
+
 ## 4. Verify before declaring the cutover healthy
 
 On the VPS, verify operations are loopback-only and readiness is healthy. A

@@ -10,3 +10,10 @@ using the production runbook in [`../../docs/production.md`](../../docs/producti
 The paths in `hnssh.service` assume an immutable release selected through
 `/opt/hnssh/current` and a separately provisioned key at
 `/etc/hnssh/host-key`.
+
+Run [`../validate-production-topology.sh`](../validate-production-topology.sh)
+only on a disposable Linux VM. It performs a destructive port-22 cutover with a
+test administrative route and validates the actual units, socket activation,
+peer-address preservation, sandbox, loopback operations endpoint, anonymous SSH
+journey, and stable host fingerprint. CI runs the same gate on its disposable
+Ubuntu VM.

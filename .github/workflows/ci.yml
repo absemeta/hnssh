@@ -62,3 +62,21 @@ jobs:
           path: target/release/hnssh
           if-no-files-found: error
           retention-days: 14
+
+  production-topology:
+    name: Production topology
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - release-build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: hnssh-linux-x86_64
+          path: artifact
+      - run: chmod +x artifact/hnssh deploy/validate-production-topology.sh
+      - run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server netcat-openbsd
+      - run: sudo env HNSSH_DISPOSABLE_VM=1 ./deploy/validate-production-topology.sh ./artifact/hnssh
