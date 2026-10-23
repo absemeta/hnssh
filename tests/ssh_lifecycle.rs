@@ -3581,18 +3581,26 @@ async fn visitor_sees_depth_and_node_limit_markers_without_fetching_past_them() 
         "wide-author-20000",
     )
     .await?;
-    let visit_wide_siblings = vec![b'n'; 999];
-    channel.data_bytes(visit_wide_siblings).await?;
-    // Wait for the selected comment result before explicit paging so its
-    // identity-reveal redraw cannot legitimately bring the header back over
-    // the marker after Page Down.
-    read_until_visible(
-        &mut channel,
-        &mut terminal,
-        &mut raw_output,
-        "wide-author-20999",
-    )
-    .await?;
+    // Let the actor and bounded acquisition pipeline catch up periodically.
+    // A single burst of 999 navigation events makes this correctness test
+    // depend on CI throughput rather than the node-limit behavior it covers.
+    for id in (20_100..=20_900)
+        .step_by(100)
+        .chain(std::iter::once(20_999))
+    {
+        let sibling_count = if id == 20_999 { 99 } else { 100 };
+        channel.data_bytes(vec![b'n'; sibling_count]).await?;
+        read_until_visible(
+            &mut channel,
+            &mut terminal,
+            &mut raw_output,
+            &format!("wide-author-{id}"),
+        )
+        .await?;
+    }
+    // The final checkpoint waits for the selected comment result before
+    // explicit paging, so its identity-reveal redraw cannot legitimately
+    // bring the header back over the marker after Page Down.
     channel.data_bytes(&b"\x1b[6~"[..]).await?;
     read_until_visible(
         &mut channel,
