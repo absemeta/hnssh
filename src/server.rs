@@ -67,6 +67,7 @@ const PTY_REQUIRED_MESSAGE: &[u8] =
 const BUSY_MESSAGE: &[u8] = b"HNSSH is busy. Please try again shortly.\r\n";
 const INPUT_RATE_LIMIT_MESSAGE: &[u8] =
     b"HNSSH closed this browsing session because its input rate stayed above 8 KiB/s.\r\n";
+const RESTART_MESSAGE: &[u8] = b"HNSSH is restarting. Reconnect in a moment.\r\n";
 
 #[derive(Clone, Debug)]
 pub struct SessionTimeouts {
@@ -406,6 +407,7 @@ async fn run_connection(
                 content,
                 progress,
                 &scope,
+                shutdown.clone(),
                 session_admission,
                 session_timeouts,
                 telemetry.clone(),
@@ -634,6 +636,12 @@ fn needs_background_revalidation<T>(
             .is_ok_and(|snapshot| snapshot.freshness.is_stale())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActorExit {
+    Visitor,
+    ServerShutdown,
+}
+
 enum ActorEvent {
     TopFeed {
         result: Result<ContentSnapshot<Vec<FeedEntryId>>, ContentError>,
@@ -803,6 +811,7 @@ struct SessionActor {
     output: TerminalOutput,
     timeouts: SessionTimeouts,
     timeout_warning: Option<TimeoutWarning>,
+    shutdown: CancellationToken,
     telemetry: Telemetry,
 }
 
@@ -813,6 +822,7 @@ impl SessionActor {
         source: Arc<dyn ContentSource>,
         handle: server::Handle,
         timeouts: SessionTimeouts,
+        shutdown: CancellationToken,
         telemetry: Telemetry,
     ) -> Result<Self, ActorError> {
         Ok(Self {
@@ -826,6 +836,7 @@ impl SessionActor {
             output: TerminalOutput::new(size.area(), channel, handle, telemetry.clone())?,
             timeouts,
             timeout_warning: None,
+            shutdown,
             telemetry,
         })
     }
@@ -839,12 +850,14 @@ impl SessionActor {
         stop: CancellationToken,
         input_excess: Arc<AtomicBool>,
     ) -> Result<(), ActorError> {
+        let shutdown = self.shutdown.clone();
         let mut result = self
             .browse(
                 &mut keys,
                 &mut sizes,
                 &idle_activity,
                 &mut activity_changes,
+                &shutdown,
                 &stop,
             )
             .await;
@@ -862,7 +875,8 @@ impl SessionActor {
                 self.telemetry.session_closed(SessionClosureKind::InputRate)
             }
             Err(ActorError::Terminal(_)) => self.telemetry.render_failed(),
-            Ok(()) | Err(ActorError::OutputClosed | ActorError::ClockRange) => {}
+            Ok(ActorExit::Visitor | ActorExit::ServerShutdown)
+            | Err(ActorError::OutputClosed | ActorError::ClockRange) => {}
         }
         self.top_feed_task.abort_all();
         self.load_tasks.abort_all();
@@ -889,13 +903,14 @@ impl SessionActor {
                 duration_label(self.timeouts.maximum_lifetime),
             )
             .into_bytes(),
-            Ok(())
+            Ok(ActorExit::ServerShutdown) => RESTART_MESSAGE.to_vec(),
+            Ok(ActorExit::Visitor)
             | Err(ActorError::Terminal(_) | ActorError::OutputClosed | ActorError::ClockRange) => {
                 Vec::new()
             }
         };
         self.output.finish(u32::from(failed), notice).await;
-        result
+        result.map(|_| ())
     }
 
     async fn browse(
@@ -904,8 +919,9 @@ impl SessionActor {
         sizes: &mut watch::Receiver<TerminalSize>,
         idle_activity: &IdleActivity,
         activity_changes: &mut watch::Receiver<u64>,
+        shutdown: &CancellationToken,
         stop: &CancellationToken,
-    ) -> Result<(), ActorError> {
+    ) -> Result<ActorExit, ActorError> {
         self.redraw()?;
         self.pending_top_feed = Some(ContentUpdate::Initial);
         let output_failed = self.output.failed();
@@ -940,14 +956,15 @@ impl SessionActor {
             );
             let event = tokio::select! {
                 biased;
-                _ = stop.cancelled() => return Ok(()),
+                _ = shutdown.cancelled() => return Ok(ActorExit::ServerShutdown),
+                _ = stop.cancelled() => return Ok(ActorExit::Visitor),
                 _ = output_failed.cancelled() => return Err(ActorError::OutputClosed),
                 changed = activity_changes.changed() => {
-                    if changed.is_err() { return Ok(()); }
+                    if changed.is_err() { return Ok(ActorExit::Visitor); }
                     continue;
                 }
                 changed = sizes.changed() => {
-                    if changed.is_err() { return Ok(()); }
+                    if changed.is_err() { return Ok(ActorExit::Visitor); }
                     self.size = *sizes.borrow_and_update();
                     self.browser.request_entry_reveal();
                     self.output.resize(self.size.area())?;
@@ -955,7 +972,7 @@ impl SessionActor {
                     continue;
                 }
                 key = keys.recv() => {
-                    let Some(key) = key else { return Ok(()); };
+                    let Some(key) = key else { return Ok(ActorExit::Visitor); };
                     let page_len = ui::navigation_page_len(self.browser.view_kind(), self.size.rows);
                     match self.browser.handle_key(key, page_len) {
                         CommandOutcome::Redraw | CommandOutcome::LoadComments => self.redraw()?,
@@ -969,7 +986,7 @@ impl SessionActor {
                             self.load_entries(entries, ContentUpdate::Initial);
                         }
                         CommandOutcome::Unchanged => {}
-                        CommandOutcome::Quit => return Ok(()),
+                        CommandOutcome::Quit => return Ok(ActorExit::Visitor),
                     }
                     continue;
                 }
@@ -1305,6 +1322,7 @@ struct BrowsingSession {
     sizes: Option<watch::Sender<TerminalSize>>,
     output_channel: Option<ChannelWriteHalf<server::Msg>>,
     stop: CancellationToken,
+    shutdown: CancellationToken,
     ended: CancellationToken,
     channel_closed: CancellationToken,
     input_excess: Arc<AtomicBool>,
@@ -1316,6 +1334,7 @@ impl BrowsingSession {
         content: Arc<dyn ContentSource>,
         progress: watch::Sender<SetupProgress>,
         scope: &SessionScope,
+        shutdown: CancellationToken,
         session_admission: SessionAdmission,
         session_timeouts: SessionTimeouts,
         telemetry: Telemetry,
@@ -1338,6 +1357,7 @@ impl BrowsingSession {
             sizes: None,
             output_channel: None,
             stop: scope.stop.clone(),
+            shutdown,
             ended: scope.ended.clone(),
             channel_closed: scope.channel_closed.clone(),
             input_excess: Arc::new(AtomicBool::new(false)),
@@ -1372,6 +1392,7 @@ impl BrowsingSession {
             Arc::clone(&self.content),
             session.handle(),
             self.session_timeouts.clone(),
+            self.shutdown.clone(),
             self.telemetry.clone(),
         ) {
             Ok(actor) => actor,

@@ -4,7 +4,7 @@
 
 **Blocked by:** 10 — Protect established browsing sessions from overload; 12 — Run HNSSH on public port 22 with stable host identity.
 
-**Status:** ready-for-agent
+**Status:** in-progress
 
 - [ ] Releases are immutable versioned binaries with checksums, installed beside prior versions and selected atomically without storing runtime state in a release.
 - [ ] Deployment verifies local health, a real external SSH browsing journey, and the expected host-key fingerprint before declaring success.
@@ -14,3 +14,7 @@
 - [ ] Rollback atomically selects the prior release, restarts it, verifies health and SSH, and presents the same host-key fingerprint.
 - [ ] Failed deployment and forced-shutdown paths leave no orphan processes, leaked admission permits, writable stale release state, or regenerated host key.
 - [ ] Linux integration tests perform upgrade, active/idle/slow-session shutdown, failed health verification, automatic rollback, explicit rollback, and fingerprint comparison.
+
+## Implementation notes
+
+The production entry point now handles systemd's SIGTERM as well as Ctrl+C and routes both through the server's bounded drain path. Established writable browsing sessions restore terminal state, receive a concise restart notice, and close successfully; non-reading sessions remain bounded. The Linux socket-activation test now requires the production binary to exit successfully after SIGTERM. Release installation, health-checked deployment, rollback tooling, shared-upstream shutdown, and full Linux upgrade/rollback validation remain open.

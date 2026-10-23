@@ -7,7 +7,7 @@ mod systemd_activation;
 use clap::Parser;
 use hnssh::{AdmissionLimits, Server, ServerConfig, SessionTimeouts, privacy_safe_process_entry};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -126,12 +126,34 @@ async fn run(
 
     let shutdown = CancellationToken::new();
     let signal = shutdown.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal.cancel();
+    let signal_task = tokio::spawn(async move {
+        match shutdown_signal().await {
+            Ok(()) => signal.cancel(),
+            Err(error) => {
+                warn!(signal.failure = "register", %error, "could not listen for shutdown signal")
+            }
         }
     });
 
-    server.run(shutdown).await?;
+    let result = server.run(shutdown).await;
+    signal_task.abort();
+    let _ = signal_task.await;
+    result?;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }

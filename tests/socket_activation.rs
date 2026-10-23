@@ -6,14 +6,14 @@ use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use russh::keys::{Algorithm, PrivateKey, ssh_key};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[test]
-fn production_binary_accepts_the_native_systemd_listener() -> TestResult {
+fn production_binary_accepts_the_native_systemd_listener_and_drains_on_sigterm() -> TestResult {
     let key_directory = tempfile::tempdir()?;
     let host_key_path = key_directory.path().join("host-key");
     let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
@@ -75,9 +75,37 @@ fn production_binary_accepts_the_native_systemd_listener() -> TestResult {
             Err(format!("inherited listener did not reach HNSSH: {greeting:?}").into())
         }
     })();
-    if child.try_wait()?.is_none() {
-        child.kill()?;
-        child.wait()?;
+    if let Err(error) = result {
+        if child.try_wait()?.is_none() {
+            child.kill()?;
+            child.wait()?;
+        }
+        return Err(error);
     }
-    result
+
+    // SAFETY: the child PID came from this live Child handle, and SIGTERM has
+    // no pointer or shared-memory requirements.
+    if unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } == -1 {
+        let error = io::Error::last_os_error();
+        if child.try_wait()?.is_none() {
+            child.kill()?;
+            child.wait()?;
+        }
+        return Err(error.into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(format!("HNSSH did not exit cleanly after SIGTERM: {status}").into());
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            return Err("HNSSH did not finish draining within five seconds".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

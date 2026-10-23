@@ -241,8 +241,9 @@ async fn wait_count(count: &AtomicUsize, expected: usize) -> TestResult {
 async fn read_restored_close(
     channel: &mut Channel<client::Msg>,
     terminal: &mut vt100::Parser,
-) -> TestResult {
-    timeout(TEST_TIMEOUT, async {
+) -> TestResult<Vec<u8>> {
+    let output = timeout(TEST_TIMEOUT, async {
+        let mut raw_output = Vec::new();
         let mut status = false;
         let mut eof = false;
         loop {
@@ -253,6 +254,7 @@ async fn read_restored_close(
             {
                 ChannelMsg::Data { data } => {
                     assert!(!status && !eof, "data after exit status/EOF");
+                    raw_output.extend_from_slice(&data);
                     terminal.process(&data);
                 }
                 ChannelMsg::ExitStatus { exit_status } => {
@@ -270,14 +272,14 @@ async fn read_restored_close(
                 }
                 ChannelMsg::Close => {
                     assert!(status && eof);
-                    return Ok::<_, Box<dyn std::error::Error>>(());
+                    return Ok::<_, Box<dyn std::error::Error>>(raw_output);
                 }
                 _ => {}
             }
         }
     })
     .await??;
-    Ok(())
+    Ok(output)
 }
 
 #[tokio::test]
@@ -535,7 +537,14 @@ async fn eof_quit_and_shutdown_restore_writable_screens_and_cancel_acquisition()
             "shutdown" => server.shutdown.cancel(),
             _ => unreachable!(),
         }
-        read_restored_close(&mut channel, &mut terminal).await?;
+        let close_output = read_restored_close(&mut channel, &mut terminal).await?;
+        let close_output = String::from_utf8_lossy(&close_output);
+        if ending == "shutdown" {
+            assert!(close_output.contains("HNSSH is restarting"));
+            assert!(close_output.contains("Reconnect in a moment"));
+        } else {
+            assert!(!close_output.contains("HNSSH is restarting"));
+        }
         wait_count(&cancelled, 1).await?;
         assert_eq!(
             cancelled.load(Ordering::SeqCst),
